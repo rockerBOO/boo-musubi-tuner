@@ -5,31 +5,77 @@ description = "Training extensions (self-flow, wavelet-loss, explorative-modelin
 readme = "README.md"
 requires-python = ">=3.10, <3.13"
 dependencies = [
-    "musubi-tuner[cu130]",
+    "musubi-tuner",
 ]
+
+[project.optional-dependencies]
+cu124 = [
+    "torch>=2.5.1",
+    "torchvision>=0.20.1",
+]
+cu128 = [
+    "torch>=2.7.1",
+    "torchvision>=0.22.1",
+]
+cu130 = [
+    "torch>=2.9.1",
+    "torchvision>=0.24.1",
+]
+cu132 = [
+    "torch>=2.12.0",
+    "torchvision>=0.27.0",
+]
+
+[tool.uv]
+conflicts = [
+  [
+    { extra = "cu124" },
+    { extra = "cu128" },
+    { extra = "cu130" },
+    { extra = "cu132" },
+  ],
+]
+
+[tool.uv.sources]
+torch = [
+  { index = "pytorch-cu124", extra = "cu124" },
+  { index = "pytorch-cu128", extra = "cu128" },
+  { index = "pytorch-cu130", extra = "cu130" },
+  { index = "pytorch-cu132", extra = "cu132" },
+]
+torchvision = [
+  { index = "pytorch-cu124", extra = "cu124" },
+  { index = "pytorch-cu128", extra = "cu128" },
+  { index = "pytorch-cu130", extra = "cu130" },
+  { index = "pytorch-cu132", extra = "cu132" },
+]
+musubi-tuner = { git = "https://github.com/rockerBOO/musubi-tuner.git", branch = "compute-loss-reduction" }
+
+[[tool.uv.index]]
+name = "pytorch-cu124"
+url = "https://download.pytorch.org/whl/cu124"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu132"
+url = "https://download.pytorch.org/whl/cu132"
+explicit = true
 
 [dependency-groups]
 dev = [
     "pytest>=8.0.0",
     "ruff>=0.12.10",
 ]
-
-[tool.uv.sources]
-# Carries PR #1042 (https://github.com/kohya-ss/musubi-tuner/pull/1042) ahead of upstream main;
-# re-pin to kohya-ss/musubi-tuner main once it merges.
-musubi-tuner = { git = "https://github.com/rockerBOO/musubi-tuner.git", branch = "compute-loss-reduction" }
-
-# torch/torchvision come from musubi-tuner's cu130 optional-dependency group (see
-# ../others/musubi-tuner/pyproject.toml); mirrors that repo's own .uv.env (UV_EXTRA=cu130).
-# Without this, plain "torch" resolves to a CPU/non-index build and torchvision is never
-# pulled in at all (musubi-tuner only depends on it via the cuNNN extras).
-torch = [{ index = "pytorch-cu130" }]
-torchvision = [{ index = "pytorch-cu130" }]
-
-[[tool.uv.index]]
-name = "pytorch-cu130"
-url = "https://download.pytorch.org/whl/cu130"
-explicit = true
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]
