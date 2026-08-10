@@ -5,7 +5,8 @@ dependency, rather than as forked branches of musubi-tuner itself.
 
 ## Extensions
 
-- `boo_musubi_tuner.self_flow` — Self-Flow FLUX.2 trainer (`flux_2_train_network_self_flow.py`)
+- `boo_musubi_tuner.self_flow` — Self-Flow trainers for FLUX.2 (`flux_2_train_network_self_flow.py`) and Krea 2
+  (`krea2_train_network_self_flow.py`)
 - `boo_musubi_tuner.wavelet_loss` — pluggable wavelet loss FLUX.2 trainer (`flux_2_train_network_wavelet_loss.py`)
 - `boo_musubi_tuner.explorative_modeling` — best-of-K candidate selection mixin (`explorative_modeling.py`) plus
   FLUX.2 and Krea2 trainer entry points
@@ -34,6 +35,7 @@ Each trainer is run the same way as musubi-tuner's own scripts, e.g.:
 
 ```bash
 python src/boo_musubi_tuner/self_flow/flux_2_train_network_self_flow.py ...
+python src/boo_musubi_tuner/self_flow/krea2_train_network_self_flow.py ...
 python src/boo_musubi_tuner/wavelet_loss/flux_2_train_network_wavelet_loss.py ...
 python src/boo_musubi_tuner/explorative_modeling/flux_2_train_network_xm.py ...
 python src/boo_musubi_tuner/explorative_modeling/krea2_train_network_xm.py ...
