@@ -746,20 +746,24 @@ class Krea2SelfFlowNetworkTrainer(Krea2NetworkTrainer):
 
     def extra_metadata(self, args: argparse.Namespace) -> dict:
         """Return ``ss_self_flow_*`` keys for embedding into safetensors metadata."""
+        metadata = dict(super().extra_metadata(args))
         if not args.self_flow:
-            return {}
-        return {
-            "ss_self_flow": True,
-            "ss_self_flow_gamma": args.self_flow_gamma,
-            "ss_self_flow_gamma_warmup_steps": args.self_flow_gamma_warmup_steps,
-            "ss_self_flow_mask_ratio": args.mask_ratio,
-            "ss_self_flow_ema_decay": args.ema_decay,
-            "ss_self_flow_student_layer": args.student_feature_layer,
-            "ss_self_flow_teacher_layer": args.teacher_feature_layer,
-            "ss_self_flow_teacher_coupling_prob": args.self_flow_teacher_coupling_prob,
-            "ss_self_flow_teacher_coupling_decay": args.self_flow_teacher_coupling_decay,
-            "ss_self_flow_teacher_mismatch_ratio": args.self_flow_teacher_mismatch_ratio,
-        }
+            return metadata
+        metadata.update(
+            {
+                "ss_self_flow": True,
+                "ss_self_flow_gamma": args.self_flow_gamma,
+                "ss_self_flow_gamma_warmup_steps": args.self_flow_gamma_warmup_steps,
+                "ss_self_flow_mask_ratio": args.mask_ratio,
+                "ss_self_flow_ema_decay": args.ema_decay,
+                "ss_self_flow_student_layer": args.student_feature_layer,
+                "ss_self_flow_teacher_layer": args.teacher_feature_layer,
+                "ss_self_flow_teacher_coupling_prob": args.self_flow_teacher_coupling_prob,
+                "ss_self_flow_teacher_coupling_decay": args.self_flow_teacher_coupling_decay,
+                "ss_self_flow_teacher_mismatch_ratio": args.self_flow_teacher_mismatch_ratio,
+            }
+        )
+        return metadata
 
     def on_before_sample_images(
         self, accelerator, args, epoch, steps, vae, transformer, network, sample_parameters, dit_dtype

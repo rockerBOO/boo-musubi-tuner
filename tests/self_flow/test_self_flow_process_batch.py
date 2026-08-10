@@ -129,9 +129,7 @@ def test_process_batch_propagates_compute_loss_metrics(tiny_model):
         None,
         global_step=10,
     )
-    assert "loss/custom_term" in metrics, (
-        f"compute_loss metrics were dropped by the self-flow process_batch; got {sorted(metrics)}"
-    )
+    assert "loss/custom_term" in metrics, f"compute_loss metrics were dropped by the self-flow process_batch; got {sorted(metrics)}"
     assert "loss/gen" in metrics and "loss/rep" in metrics
 
 

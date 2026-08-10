@@ -107,6 +107,7 @@ class Flux2WaveletLossNetworkTrainer(Flux2NetworkTrainer):
         optimizer,
     ) -> None:
         """Construct and move the WaveletLoss module to the training device."""
+        super().on_train_start(args, accelerator, network, transformer, optimizer)
         if not args.wavelet_loss:
             return
 
@@ -223,30 +224,36 @@ class Flux2WaveletLossNetworkTrainer(Flux2NetworkTrainer):
 
     def extra_metadata(self, args: argparse.Namespace) -> dict:
         """Embed wavelet-loss configuration into the saved safetensors metadata."""
+        metadata = dict(super().extra_metadata(args))
         if not args.wavelet_loss:
-            return {}
+            return metadata
         import json
 
-        return {
-            "ss_wavelet_loss": True,
-            "ss_wavelet_loss_alpha": args.wavelet_loss_alpha,
-            "ss_wavelet_loss_type": args.wavelet_loss_type,
-            "ss_wavelet_loss_transform": args.wavelet_loss_transform,
-            "ss_wavelet_loss_wavelet": args.wavelet_loss_wavelet,
-            "ss_wavelet_loss_level": args.wavelet_loss_level,
-            "ss_wavelet_loss_band_weights": json.dumps(args.wavelet_loss_band_weights) if args.wavelet_loss_band_weights else None,
-            "ss_wavelet_loss_band_level_weights": json.dumps(args.wavelet_loss_band_level_weights)
-            if args.wavelet_loss_band_level_weights
-            else None,
-            "ss_wavelet_loss_quaternion_component_weights": json.dumps(args.wavelet_loss_quaternion_component_weights)
-            if args.wavelet_loss_quaternion_component_weights
-            else None,
-            "ss_wavelet_loss_ll_level_threshold": args.wavelet_loss_ll_level_threshold,
-            "ss_wavelet_loss_max_timestep": args.wavelet_loss_max_timestep,
-            "ss_wavelet_loss_timestep_cutoff": args.wavelet_loss_timestep_cutoff,
-            "ss_wavelet_loss_timestep_transition_width": args.wavelet_loss_timestep_transition_width,
-            "ss_wavelet_loss_rectified_flow": getattr(args, "wavelet_loss_rectified_flow", True),
-        }
+        metadata.update(
+            {
+                "ss_wavelet_loss": True,
+                "ss_wavelet_loss_alpha": args.wavelet_loss_alpha,
+                "ss_wavelet_loss_type": args.wavelet_loss_type,
+                "ss_wavelet_loss_transform": args.wavelet_loss_transform,
+                "ss_wavelet_loss_wavelet": args.wavelet_loss_wavelet,
+                "ss_wavelet_loss_level": args.wavelet_loss_level,
+                "ss_wavelet_loss_band_weights": json.dumps(args.wavelet_loss_band_weights)
+                if args.wavelet_loss_band_weights
+                else None,
+                "ss_wavelet_loss_band_level_weights": json.dumps(args.wavelet_loss_band_level_weights)
+                if args.wavelet_loss_band_level_weights
+                else None,
+                "ss_wavelet_loss_quaternion_component_weights": json.dumps(args.wavelet_loss_quaternion_component_weights)
+                if args.wavelet_loss_quaternion_component_weights
+                else None,
+                "ss_wavelet_loss_ll_level_threshold": args.wavelet_loss_ll_level_threshold,
+                "ss_wavelet_loss_max_timestep": args.wavelet_loss_max_timestep,
+                "ss_wavelet_loss_timestep_cutoff": args.wavelet_loss_timestep_cutoff,
+                "ss_wavelet_loss_timestep_transition_width": args.wavelet_loss_timestep_transition_width,
+                "ss_wavelet_loss_rectified_flow": getattr(args, "wavelet_loss_rectified_flow", True),
+            }
+        )
+        return metadata
 
 
 def _parse_band_weights(weights_str: Optional[str]) -> Optional[dict[str, float]]:

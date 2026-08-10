@@ -15,9 +15,9 @@ Per-token conditioning is achieved by hooking ``time_in`` /
 unmodified Flux2 model — its Modulation and LastLayer already broadcast 3D
 vectors natively.
 
-Limitations (first pass): coupling-prob decay schedules are constant-only,
-patch-locality mask modes are not ported, and control images
-(``latents_control_*``) raise ``NotImplementedError`` with ``--self_flow``.
+Limitations: coupling-prob decay schedules are constant-only, patch-locality
+mask modes are not ported, and control images (``latents_control_*``) raise
+``NotImplementedError`` with ``--self_flow``.
 
 Internal extension point — no API stability guarantees. Subclasses live in
 this repo; if you fork, expect breakage on updates.
@@ -586,7 +586,7 @@ class Flux2SelfFlowNetworkTrainer(Flux2NetworkTrainer):
     ) -> tuple[torch.Tensor, dict[str, float]]:
         """Self-Flow step replacing vanilla flow matching.
 
-        Outline (mirrors PR #913's ``_self_flow_step``):
+        Outline:
           1. Sample two timesteps; per-sample ``teacher = min(t_a, t_b)``,
              ``student = max(t_a, t_b)``.
           2. Reconstruct two noisy inputs (teacher / student) via flow
@@ -698,7 +698,9 @@ class Flux2SelfFlowNetworkTrainer(Flux2NetworkTrainer):
         feat_student = output.extra.get("features")
 
         # 5. L_gen via the base loss (weighting from student timesteps), then L_rep
-        L_gen, gen_metrics = self.compute_loss(args, output, timesteps_student, noise_scheduler, dit_dtype, network_dtype, global_step)
+        L_gen, gen_metrics = self.compute_loss(
+            args, output, timesteps_student, noise_scheduler, dit_dtype, network_dtype, global_step
+        )
 
         # Amendment 2: loud failure if feature hooks misconfigured; never silently drop L_rep.
         if feat_student is None or feat_teacher is None:
@@ -827,20 +829,24 @@ class Flux2SelfFlowNetworkTrainer(Flux2NetworkTrainer):
 
     def extra_metadata(self, args: argparse.Namespace) -> dict:
         """Return ``ss_self_flow_*`` keys for embedding into safetensors metadata."""
+        metadata = dict(super().extra_metadata(args))
         if not args.self_flow:
-            return {}
-        return {
-            "ss_self_flow": True,
-            "ss_self_flow_gamma": args.self_flow_gamma,
-            "ss_self_flow_gamma_warmup_steps": args.self_flow_gamma_warmup_steps,
-            "ss_self_flow_mask_ratio": args.mask_ratio,
-            "ss_self_flow_ema_decay": args.ema_decay,
-            "ss_self_flow_student_layer": args.student_feature_layer,
-            "ss_self_flow_teacher_layer": args.teacher_feature_layer,
-            "ss_self_flow_teacher_coupling_prob": args.self_flow_teacher_coupling_prob,
-            "ss_self_flow_teacher_coupling_decay": args.self_flow_teacher_coupling_decay,
-            "ss_self_flow_teacher_mismatch_ratio": args.self_flow_teacher_mismatch_ratio,
-        }
+            return metadata
+        metadata.update(
+            {
+                "ss_self_flow": True,
+                "ss_self_flow_gamma": args.self_flow_gamma,
+                "ss_self_flow_gamma_warmup_steps": args.self_flow_gamma_warmup_steps,
+                "ss_self_flow_mask_ratio": args.mask_ratio,
+                "ss_self_flow_ema_decay": args.ema_decay,
+                "ss_self_flow_student_layer": args.student_feature_layer,
+                "ss_self_flow_teacher_layer": args.teacher_feature_layer,
+                "ss_self_flow_teacher_coupling_prob": args.self_flow_teacher_coupling_prob,
+                "ss_self_flow_teacher_coupling_decay": args.self_flow_teacher_coupling_decay,
+                "ss_self_flow_teacher_mismatch_ratio": args.self_flow_teacher_mismatch_ratio,
+            }
+        )
+        return metadata
 
     def extra_step_logs(self, args: argparse.Namespace, logs: dict) -> dict:
         """Drain per-step Self-Flow metrics into the trainer's log payload."""
@@ -853,7 +859,7 @@ class Flux2SelfFlowNetworkTrainer(Flux2NetworkTrainer):
 
 
 def self_flow_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
-    """Self-Flow-specific CLI arguments. Mirrors PR #913's additions."""
+    """Self-Flow-specific CLI arguments."""
     parser.add_argument(
         "--self_flow",
         action="store_true",

@@ -12,14 +12,16 @@ musubi-tuner's own model/trainer files.
 Extensions:
 - `boo_musubi_tuner.self_flow` — Self-Flow trainers implementing arXiv:2603.06507 (dual-timestep scheduling +
   representation-alignment distillation) via forward hooks, for FLUX.2 (`flux_2_train_network_self_flow.py`) and
-  Krea 2 (`krea2_train_network_self_flow.py`). The K2 port additionally needs an instance-level monkeypatch of
-  `LastLayer.modulation.forward` alongside the forward hook on `tmlp`, since K2's final-layer modulation can't
-  take a per-token vector via hooking alone (its scale/shift broadcast only supports a token axis of 1 or 2 and
-  raises before any hook can intervene).
+  Krea 2 (`krea2_train_network_self_flow.py`) — see [docs/self-flow.md](docs/self-flow.md) for details.
 - `boo_musubi_tuner.wavelet_loss` — pluggable frequency-domain auxiliary loss FLUX.2 trainer
   (`flux_2_train_network_wavelet_loss.py`), optional dependency on the separate `wavelet_loss` package.
 - `boo_musubi_tuner.explorative_modeling` — best-of-K candidate selection mixin (`explorative_modeling.py`,
   `ExplorativeModelingMixin`) plus FLUX.2 and Krea2 trainer entry points.
+
+## Adding new features
+
+See [docs/agents/features.md](docs/agents/features.md) for the checklist of files to create/update when adding
+a new extension or feature.
 
 ## Setup
 
@@ -50,13 +52,7 @@ Always run `uv run ruff check .` and `uv run ruff format .` before committing �
 Tests are CPU-only and use tiny Flux2 configs (see `tests/self_flow/conftest.py`'s `tiny_params`/`tiny_model`
 fixtures — `hidden_size=16`, 2+2 blocks) rather than real weights, so the suite runs fast without a GPU.
 
-Running a trainer (each mirrors musubi-tuner's own script invocation):
-```bash
-python src/boo_musubi_tuner/self_flow/flux_2_train_network_self_flow.py ...
-python src/boo_musubi_tuner/wavelet_loss/flux_2_train_network_wavelet_loss.py ...
-python src/boo_musubi_tuner/explorative_modeling/flux_2_train_network_xm.py ...
-python src/boo_musubi_tuner/explorative_modeling/krea2_train_network_xm.py ...
-```
+For running a trainer, see README.md's "Running trainers" section.
 
 ## Architecture
 
@@ -101,19 +97,7 @@ re-calling `get_noisy_model_input_and_timesteps` (breaks for architectures overr
 non-trivial resampling), and it always calls `compute_loss(..., reduction="none")` (breaks for architectures
 whose `compute_loss` override doesn't accept `reduction`). Check these before mixing XM into a new architecture.
 
-### Module layout
-
-Each extension package under `src/boo_musubi_tuner/<extension>/` contains:
-- one module with the extension's core logic/math as free functions plus the trainer subclass/mixin
-  (`explorative_modeling.py`, or the whole `flux_2_train_network_*.py` file for self_flow/wavelet_loss)
-- an `*_setup_parser(parser)` function adding the extension's CLI args
-- a `main()` entry point wiring `setup_parser_common()` + the base model's `*_setup_parser()` + the extension's
-  `*_setup_parser()`, then constructing and running the trainer
-
-`tests/<extension>/` mirrors this 1:1, generally one test file per concern (e.g. self_flow splits into
-`test_self_flow_loss.py`, `test_self_flow_masking.py`, `test_self_flow_timestep.py`, `test_per_token_hooks.py`,
-`test_feature_hooks.py`, `test_rep_proj_optimizer.py`, `test_self_flow_ema.py`, `test_self_flow_save.py`,
-`test_self_flow_lifecycle.py`, `test_self_flow_call_dit.py`, `test_self_flow_arg_validation.py`).
+For module/test layout conventions, see [docs/agents/features.md](docs/agents/features.md).
 
 ### Internal API stability
 

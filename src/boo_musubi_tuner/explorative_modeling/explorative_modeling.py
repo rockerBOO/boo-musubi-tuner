@@ -74,8 +74,8 @@ class ExplorativeModelingMixin:
     hooks, no model edits. When ``args.explorative_modeling`` is off, both
     delegate to ``super()`` unchanged.
 
-    Known composability gaps (documented, not fixed here — see the design doc
-    for detail):
+    Known composability gaps (documented, not fixed here — see
+    ``docs/explorative-modeling.md`` for detail):
 
     - Candidates 2..K are built by reimplementing the base trainer's noising
       math directly (the continuous-t / ``get_sigmas`` branches in

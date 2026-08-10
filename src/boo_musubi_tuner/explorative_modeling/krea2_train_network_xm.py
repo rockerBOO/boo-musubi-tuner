@@ -2,9 +2,8 @@
 
 Best-of-K training: mixes ``ExplorativeModelingMixin`` into
 ``Krea2NetworkTrainer``. XM needs no architecture-specific code — no model
-edits, no feature hooks, no teacher/student state — so unlike the Self-Flow
-skeleton (``flux_2_train_network_self_flow.py``), this file is only wiring
-(mixin composition + arg parser + main), not a stub.
+edits, no feature hooks, no teacher/student state — so this file is only
+wiring: mixin composition + arg parser + main.
 
 Reference: https://explorative-modeling.github.io/
 """
