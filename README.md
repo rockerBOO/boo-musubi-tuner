@@ -12,12 +12,16 @@ Repo: [github.com/rockerBOO/boo-musubi-tuner](https://github.com/rockerBOO/boo-m
 
 ## Setup
 
-`musubi-tuner` is a required dependency; `pyproject.toml` needs to point it at a musubi-tuner checkout (local
-path or git) before this will install. See the `[tool.uv.sources]` section in `pyproject.toml` for both options.
-
 ```bash
+git clone https://github.com/rockerBOO/boo-musubi-tuner.git
+cd boo-musubi-tuner
 uv sync
 ```
+
+`musubi-tuner` is pulled in as a dependency, pinned to a branch on the
+[rockerBOO fork](https://github.com/rockerBOO/musubi-tuner) (needed for Explorative Modeling's
+`compute_loss(reduction="none")` support — see
+[docs/explorative-modeling.md](docs/explorative-modeling.md#requirements)).
 
 ## Running trainers
 
@@ -34,3 +38,16 @@ accelerate launch src/boo_musubi_tuner/explorative_modeling/krea2_train_network_
 
 Explorative Modeling additionally requires a musubi-tuner core patch — see
 [docs/explorative-modeling.md](docs/explorative-modeling.md#requirements).
+
+## Development
+
+```bash
+uv run pytest                                    # full test suite
+uv run pytest tests/self_flow/                   # one extension's tests
+uv run pytest tests/self_flow/test_self_flow_loss.py::test_name   # single test
+uv run ruff check .                              # lint (line-length 132, configured in pyproject.toml)
+uv run ruff format .                             # format
+```
+
+Always run `uv run ruff check .` and `uv run ruff format .` before committing — there's no pre-commit hook
+enforcing this, so it's on the person/agent making the commit.
