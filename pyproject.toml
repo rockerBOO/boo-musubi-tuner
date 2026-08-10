@@ -1,0 +1,42 @@
+[project]
+name = "boo-musubi-tuner"
+version = "0.1.0"
+description = "Training extensions (self-flow, wavelet-loss, explorative-modeling) built on musubi-tuner as a library"
+readme = "README.md"
+requires-python = ">=3.10, <3.13"
+dependencies = [
+    "musubi-tuner",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0.0",
+]
+
+[tool.uv.sources]
+# Active default: editable local checkout, for iterating on musubi-tuner and
+# this repo together on this machine. explorative_modeling needs the
+# `compute_loss(reduction="none")` support from PR #1042
+# (https://github.com/kohya-ss/musubi-tuner/pull/1042, open, not yet merged
+# to upstream main) — make sure ../others/musubi-tuner has that branch
+# (`compute-loss-reduction` on the rockerBOO fork) checked out or merged in.
+musubi-tuner = { path = "../others/musubi-tuner", editable = true }
+
+# Portable/CI alternative: pin to a commit on the boo fork's
+# `compute-loss-reduction` branch, which carries PR #1042 ahead of main.
+# Swap the block above for this one, and re-pin once #1042 merges upstream
+# (at which point this can point at kohya-ss/musubi-tuner main instead):
+#
+# musubi-tuner = { git = "https://github.com/rockerBOO/musubi-tuner.git", branch = "compute-loss-reduction" }
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 132
+indent-width = 4
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
