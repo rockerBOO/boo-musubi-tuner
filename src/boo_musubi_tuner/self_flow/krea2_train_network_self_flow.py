@@ -21,16 +21,14 @@ Internal extension point — no API stability guarantees.
 import argparse
 import logging
 import os
-from typing import Optional
 
 import torch
 from accelerate import Accelerator
-from safetensors.torch import load_file, save_file
-
-from musubi_tuner.hv_train_network import setup_parser_common, read_config_from_file
+from musubi_tuner.hv_train_network import read_config_from_file, setup_parser_common
 from musubi_tuner.krea2.krea2_mmdit import temb
 from musubi_tuner.krea2_train_network import Krea2NetworkTrainer, krea2_setup_parser
 from musubi_tuner.utils import huggingface_utils
+from safetensors.torch import load_file, save_file
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -207,9 +205,9 @@ class PerTokenModulationController:
 
     def __init__(self) -> None:
         self._handles: list = []
-        self._tau: Optional[torch.Tensor] = None
-        self._tdim: Optional[int] = None
-        self._last_mod: Optional[torch.nn.Module] = None
+        self._tau: torch.Tensor | None = None
+        self._tdim: int | None = None
+        self._last_mod: torch.nn.Module | None = None
         self._orig_last_mod_forward = None
 
     def install(self, model) -> None:
@@ -274,9 +272,9 @@ class BlockFeatureExtractor:
     def __init__(self) -> None:
         self._handles: list = []
         self._installed_layers: set[int] = set()
-        self._armed_layer: Optional[int] = None
-        self._imglen: Optional[int] = None
-        self._features: Optional[torch.Tensor] = None
+        self._armed_layer: int | None = None
+        self._imglen: int | None = None
+        self._features: torch.Tensor | None = None
 
     def install(self, model, layer_indices: list[int]) -> None:
         num_blocks = len(model.blocks)
@@ -299,7 +297,7 @@ class BlockFeatureExtractor:
         self._imglen = imglen
         self._features = None
 
-    def drain(self) -> Optional[torch.Tensor]:
+    def drain(self) -> torch.Tensor | None:
         features = self._features
         self._features = None
         self._armed_layer = None
@@ -332,12 +330,12 @@ class Krea2SelfFlowNetworkTrainer(Krea2NetworkTrainer):
 
     def __init__(self) -> None:
         super().__init__()
-        self.rep_proj: Optional[torch.nn.Module] = None
-        self.ema_lora_state: Optional[dict] = None
-        self._feature_extractor: Optional[BlockFeatureExtractor] = None
-        self._modulation_controller: Optional[PerTokenModulationController] = None
+        self.rep_proj: torch.nn.Module | None = None
+        self.ema_lora_state: dict | None = None
+        self._feature_extractor: BlockFeatureExtractor | None = None
+        self._modulation_controller: PerTokenModulationController | None = None
         self._self_flow_logs: dict = {}
-        self._saved_student_state: Optional[dict] = None
+        self._saved_student_state: dict | None = None
 
     def handle_model_specific_args(self, args: argparse.Namespace) -> None:
         super().handle_model_specific_args(args)

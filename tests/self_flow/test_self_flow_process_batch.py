@@ -1,7 +1,7 @@
 import torch
+from musubi_tuner.modules.scheduling_flow_match_discrete import FlowMatchDiscreteScheduler
 
 from boo_musubi_tuner.self_flow.flux_2_train_network_self_flow import Flux2SelfFlowNetworkTrainer
-from musubi_tuner.modules.scheduling_flow_match_discrete import FlowMatchDiscreteScheduler
 
 from .test_self_flow_call_dit import make_args
 from .test_self_flow_lifecycle import PreparingAccelerator, StubNetwork

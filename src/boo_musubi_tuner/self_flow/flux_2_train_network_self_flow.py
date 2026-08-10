@@ -26,21 +26,18 @@ this repo; if you fork, expect breakage on updates.
 import argparse
 import logging
 import os
-from typing import Optional
 
 import torch
 from accelerate import Accelerator
-from safetensors.torch import load_file, save_file
-
 from musubi_tuner.flux_2.flux2_models import timestep_embedding
 from musubi_tuner.flux_2_train_network import Flux2NetworkTrainer, flux2_setup_parser
 from musubi_tuner.hv_train_network import (
     DiTOutput,
-    setup_parser_common,
     read_config_from_file,
+    setup_parser_common,
 )
 from musubi_tuner.utils import huggingface_utils
-
+from safetensors.torch import load_file, save_file
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -205,8 +202,8 @@ class PerTokenModulationController:
 
     def __init__(self) -> None:
         self._handles: list = []
-        self._tau: Optional[torch.Tensor] = None
-        self._num_txt_tokens: Optional[int] = None
+        self._tau: torch.Tensor | None = None
+        self._num_txt_tokens: int | None = None
 
     def install(self, model) -> None:
         for name in self.REQUIRED_MODULES:
@@ -276,9 +273,9 @@ class BlockFeatureExtractor:
     def __init__(self) -> None:
         self._handles: list = []
         self._installed_layers: set[int] = set()
-        self._armed_layer: Optional[int] = None
-        self._num_txt_tokens: Optional[int] = None
-        self._features: Optional[torch.Tensor] = None
+        self._armed_layer: int | None = None
+        self._num_txt_tokens: int | None = None
+        self._features: torch.Tensor | None = None
 
     def install(self, model, layer_indices: list[int]) -> None:
         num_double = len(model.double_blocks)
@@ -305,7 +302,7 @@ class BlockFeatureExtractor:
         self._num_txt_tokens = num_txt_tokens
         self._features = None
 
-    def drain(self) -> Optional[torch.Tensor]:
+    def drain(self) -> torch.Tensor | None:
         features = self._features
         self._features = None
         self._armed_layer = None
@@ -351,12 +348,12 @@ class Flux2SelfFlowNetworkTrainer(Flux2NetworkTrainer):
 
     def __init__(self) -> None:
         super().__init__()
-        self.rep_proj: Optional[torch.nn.Module] = None
-        self.ema_lora_state: Optional[dict] = None
-        self._feature_extractor: Optional[BlockFeatureExtractor] = None
-        self._modulation_controller: Optional[PerTokenModulationController] = None
+        self.rep_proj: torch.nn.Module | None = None
+        self.ema_lora_state: dict | None = None
+        self._feature_extractor: BlockFeatureExtractor | None = None
+        self._modulation_controller: PerTokenModulationController | None = None
         self._self_flow_logs: dict = {}
-        self._saved_student_state: Optional[dict] = None
+        self._saved_student_state: dict | None = None
 
     # region argument validation (existing extension point — handle_model_specific_args)
 

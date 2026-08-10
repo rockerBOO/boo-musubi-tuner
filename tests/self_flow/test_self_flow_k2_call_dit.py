@@ -3,8 +3,8 @@ import torch
 from boo_musubi_tuner.self_flow.krea2_train_network_self_flow import Krea2SelfFlowNetworkTrainer
 from tests.self_flow.conftest_k2_self_flow import make_k2_batch
 
-from .test_self_flow_k2_lifecycle import FakeAccelerator
 from .test_self_flow_k2_arg_validation import make_args
+from .test_self_flow_k2_lifecycle import FakeAccelerator
 
 
 def _trainer_with_model(tiny_k2_model):

@@ -5,9 +5,11 @@ Reference: https://explorative-modeling.github.io/
 
 import pytest
 import torch
-
 from musubi_tuner.modules.scheduling_flow_match_discrete import FlowMatchDiscreteScheduler
 from musubi_tuner.training import parser_common
+from musubi_tuner.training.timesteps import get_sigmas
+from musubi_tuner.training.trainer_base import DiTOutput, NetworkTrainer
+
 from boo_musubi_tuner.explorative_modeling.explorative_modeling import (
     _CONTINUOUS_T_SAMPLING_MODES,
     ExplorativeModelingMixin,
@@ -15,8 +17,6 @@ from boo_musubi_tuner.explorative_modeling.explorative_modeling import (
     _select_winner,
     explorative_modeling_setup_parser,
 )
-from musubi_tuner.training.timesteps import get_sigmas
-from musubi_tuner.training.trainer_base import DiTOutput, NetworkTrainer
 
 
 def test_select_winner_is_per_example_not_per_batch():
@@ -107,7 +107,7 @@ def test_process_batch_disabled_falls_through_to_base():
     batch = {"timesteps": [0.3, 0.7]}
     trainer = _ScriptedTrainer([[4.0, 1.0]])
 
-    loss, metrics = trainer.process_batch(
+    _loss, metrics = trainer.process_batch(
         args,
         _FakeAccelerator(),
         None,
@@ -255,7 +255,7 @@ def test_process_batch_literal_mode_reuses_scored_forward_no_extra_call():
     scored = [[4.0, 1.0], [1.0, 4.0], [9.0, 9.0]]
     trainer = _ScriptedTrainer(scored)  # no extra scripted loss for a regeneration call
 
-    loss, metrics = trainer.process_batch(
+    loss, _metrics = trainer.process_batch(
         args,
         _FakeAccelerator(),
         None,

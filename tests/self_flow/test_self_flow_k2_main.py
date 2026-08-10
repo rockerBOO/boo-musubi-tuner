@@ -1,9 +1,10 @@
 """Smoke test: the CLI entry point parses args and constructs the trainer
 without touching disk or GPU (train() itself is not invoked)."""
 
-from boo_musubi_tuner.self_flow.krea2_train_network_self_flow import Krea2SelfFlowNetworkTrainer, self_flow_setup_parser
-from musubi_tuner.krea2_train_network import krea2_setup_parser
 from musubi_tuner.hv_train_network import setup_parser_common
+from musubi_tuner.krea2_train_network import krea2_setup_parser
+
+from boo_musubi_tuner.self_flow.krea2_train_network_self_flow import Krea2SelfFlowNetworkTrainer, self_flow_setup_parser
 
 
 def test_self_flow_args_present_in_parser():

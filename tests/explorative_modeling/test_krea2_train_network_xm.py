@@ -4,9 +4,10 @@ No real training run — just verifies the mixin composition and CLI wiring.
 """
 
 from musubi_tuner.krea2_train_network import Krea2NetworkTrainer, krea2_setup_parser
-from boo_musubi_tuner.explorative_modeling.krea2_train_network_xm import Krea2XMNetworkTrainer
-from boo_musubi_tuner.explorative_modeling.explorative_modeling import ExplorativeModelingMixin, explorative_modeling_setup_parser
 from musubi_tuner.training.parser_common import setup_parser_common
+
+from boo_musubi_tuner.explorative_modeling.explorative_modeling import ExplorativeModelingMixin, explorative_modeling_setup_parser
+from boo_musubi_tuner.explorative_modeling.krea2_train_network_xm import Krea2XMNetworkTrainer
 
 
 def test_trainer_mixes_in_explorative_modeling_and_krea2():

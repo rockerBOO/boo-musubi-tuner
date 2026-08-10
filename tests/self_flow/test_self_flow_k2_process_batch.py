@@ -1,7 +1,7 @@
 import torch
+from musubi_tuner.modules.scheduling_flow_match_discrete import FlowMatchDiscreteScheduler
 
 from boo_musubi_tuner.self_flow.krea2_train_network_self_flow import Krea2SelfFlowNetworkTrainer
-from musubi_tuner.modules.scheduling_flow_match_discrete import FlowMatchDiscreteScheduler
 from tests.self_flow.conftest_k2_self_flow import make_k2_batch
 
 from .test_self_flow_k2_arg_validation import make_args

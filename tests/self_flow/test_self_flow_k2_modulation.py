@@ -25,7 +25,7 @@ def _build_forward_inputs(model, B=1, H=8, W=8, n_txt=3):
 
 def test_pass_through_when_not_staged(tiny_k2_model):
     torch.manual_seed(0)
-    img, context, pos, mask, imglen, N = _build_forward_inputs(tiny_k2_model)
+    img, context, pos, mask, _imglen, _N = _build_forward_inputs(tiny_k2_model)
     t = torch.rand(1)
 
     # tiny_k2_model is already .eval()'d (see conftest.py), so there is

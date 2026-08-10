@@ -8,8 +8,8 @@ Three proof tests:
 """
 
 import torch
-
 from musubi_tuner.flux_2.flux2_models import AttentionParams, timestep_embedding
+
 from boo_musubi_tuner.self_flow.flux_2_train_network_self_flow import PerTokenModulationController
 
 from .conftest import make_inputs

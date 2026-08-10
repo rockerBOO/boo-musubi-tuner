@@ -68,7 +68,7 @@ def test_extra_trainable_params_builds_rep_proj(tiny_k2_model):
     result = trainer.extra_trainable_params(args, FakeAccelerator(), None, tiny_k2_model, [])
     assert trainer.rep_proj is not None
     assert len(result) == 1
-    assert list(trainer.rep_proj.parameters())[0] in list(result[0]["params"])
+    assert next(iter(trainer.rep_proj.parameters())) in list(result[0]["params"])
 
 
 def test_on_train_start_snapshots_ema():

@@ -1,12 +1,12 @@
 import pytest
 import torch
+from musubi_tuner.hv_train_network import setup_parser_common
 
 from boo_musubi_tuner.self_flow.flux_2_train_network_self_flow import (
     Flux2SelfFlowNetworkTrainer,
     flux2_setup_parser,
     self_flow_setup_parser,
 )
-from musubi_tuner.hv_train_network import setup_parser_common
 
 
 class FakeAccelerator:

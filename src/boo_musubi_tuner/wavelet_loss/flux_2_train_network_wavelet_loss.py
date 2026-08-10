@@ -29,17 +29,15 @@ The wavelet term combines additively with the base MSE:
 
 import argparse
 import logging
-from typing import Optional
 
 import torch
 import torch.nn.functional as F
 from accelerate import Accelerator
-
 from musubi_tuner.flux_2_train_network import Flux2NetworkTrainer, flux2_setup_parser
 from musubi_tuner.hv_train_network import (
     DiTOutput,
-    setup_parser_common,
     read_config_from_file,
+    setup_parser_common,
 )
 from musubi_tuner.training.timesteps import compute_loss_weighting_for_sd3
 
@@ -64,7 +62,7 @@ class Flux2WaveletLossNetworkTrainer(Flux2NetworkTrainer):
 
     def __init__(self) -> None:
         super().__init__()
-        self.wavelet_loss: Optional["WaveletLoss"] = None  # type: ignore[type-arg]
+        self.wavelet_loss: WaveletLoss | None = None  # type: ignore[type-arg]
 
     def handle_model_specific_args(self, args: argparse.Namespace) -> None:
         # Check the optional-dependency guard FIRST so a clear error is raised
@@ -256,7 +254,7 @@ class Flux2WaveletLossNetworkTrainer(Flux2NetworkTrainer):
         return metadata
 
 
-def _parse_band_weights(weights_str: Optional[str]) -> Optional[dict[str, float]]:
+def _parse_band_weights(weights_str: str | None) -> dict[str, float] | None:
     """Parse ``ll=0.1,lh=0.01,hl=0.01,hh=0.05`` or a JSON/literal dict string."""
     if weights_str is None:
         return None

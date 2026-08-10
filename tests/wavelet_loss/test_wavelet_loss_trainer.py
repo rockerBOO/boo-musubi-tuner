@@ -9,13 +9,13 @@ import argparse
 import pytest
 import torch
 import torch.nn.functional as F
+from musubi_tuner.training.trainer_base import DiTOutput
 
 from boo_musubi_tuner.wavelet_loss.flux_2_train_network_wavelet_loss import (
+    Flux2WaveletLossNetworkTrainer,
     _parse_band_weights,
     wavelet_loss_setup_parser,
-    Flux2WaveletLossNetworkTrainer,
 )
-from musubi_tuner.training.trainer_base import DiTOutput
 
 
 def test_parse_band_weights_key_value():
@@ -103,26 +103,26 @@ class _FakeScheduler:
 
 
 def _make_args(**overrides) -> argparse.Namespace:
-    base = dict(
-        wavelet_loss=True,
-        wavelet_loss_alpha=0.1,
-        wavelet_loss_type=None,
-        wavelet_loss_transform="swt",
-        wavelet_loss_wavelet="sym7",
-        wavelet_loss_level=1,
-        wavelet_loss_band_weights=None,
-        wavelet_loss_band_level_weights=None,
-        wavelet_loss_quaternion_component_weights=None,
-        wavelet_loss_ll_level_threshold=None,
-        wavelet_loss_normalize_bands=None,
-        wavelet_loss_max_timestep=1000.0,
-        wavelet_loss_timestep_cutoff=0.7,
-        wavelet_loss_timestep_transition_width=0.4,
-        wavelet_loss_metrics=False,
-        wavelet_loss_rectified_flow=True,
-        weighting_scheme="none",
-        loss_type="l2",
-    )
+    base = {
+        "wavelet_loss": True,
+        "wavelet_loss_alpha": 0.1,
+        "wavelet_loss_type": None,
+        "wavelet_loss_transform": "swt",
+        "wavelet_loss_wavelet": "sym7",
+        "wavelet_loss_level": 1,
+        "wavelet_loss_band_weights": None,
+        "wavelet_loss_band_level_weights": None,
+        "wavelet_loss_quaternion_component_weights": None,
+        "wavelet_loss_ll_level_threshold": None,
+        "wavelet_loss_normalize_bands": None,
+        "wavelet_loss_max_timestep": 1000.0,
+        "wavelet_loss_timestep_cutoff": 0.7,
+        "wavelet_loss_timestep_transition_width": 0.4,
+        "wavelet_loss_metrics": False,
+        "wavelet_loss_rectified_flow": True,
+        "weighting_scheme": "none",
+        "loss_type": "l2",
+    }
     base.update(overrides)
     return argparse.Namespace(**base)
 
@@ -159,7 +159,7 @@ def _setup_trainer_and_batch():
 
 
 def test_x0_target_recovers_latents():
-    _, _, latents, noise, noisy, target, _, _, sigma = _setup_trainer_and_batch()
+    _, _, latents, _noise, noisy, target, _, _, sigma = _setup_trainer_and_batch()
     x0_target = noisy - sigma * target
     assert torch.allclose(x0_target, latents, atol=1e-5)
     # perfect prediction (pred == target) recovers latents too
@@ -168,7 +168,7 @@ def test_x0_target_recovers_latents():
 
 
 def test_compute_loss_with_wavelet_returns_metrics():
-    trainer, args, latents, noise, noisy, target, timesteps, scheduler, _ = _setup_trainer_and_batch()
+    trainer, args, _latents, _noise, noisy, target, timesteps, scheduler, _ = _setup_trainer_and_batch()
     pred = target + 0.1 * torch.randn_like(target)  # imperfect prediction
     output = DiTOutput(pred=pred, target=target, extra={"noisy_model_input": noisy})
 
@@ -185,7 +185,7 @@ def test_compute_loss_with_wavelet_returns_metrics():
 
 
 def test_compute_loss_disabled_equals_weighted_mse():
-    trainer, args, latents, noise, noisy, target, timesteps, scheduler, _ = _setup_trainer_and_batch()
+    trainer, args, _latents, _noise, noisy, target, timesteps, scheduler, _ = _setup_trainer_and_batch()
     args.wavelet_loss = False
     trainer.wavelet_loss = None
     pred = target + 0.1 * torch.randn_like(target)
@@ -219,7 +219,7 @@ def test_compute_loss_continuous_timesteps_no_schedule_warning(caplog):
     output = DiTOutput(pred=pred, target=target, extra={"noisy_model_input": noisy})
 
     with caplog.at_level("WARNING", logger="musubi_tuner.training.timesteps"):
-        loss, metrics = trainer.compute_loss(args, output, timesteps, scheduler, torch.float32, torch.float32, global_step=0)
+        loss, _metrics = trainer.compute_loss(args, output, timesteps, scheduler, torch.float32, torch.float32, global_step=0)
 
     assert torch.isfinite(loss)
     assert "not in the schedule" not in caplog.text
@@ -241,7 +241,7 @@ class _CapturingWavelet:
 
 
 def test_compute_loss_rectified_flow_passes_x0():
-    trainer, args, latents, noise, noisy, target, timesteps, scheduler, sigma = _setup_trainer_and_batch()
+    trainer, args, _latents, _noise, noisy, target, timesteps, scheduler, sigma = _setup_trainer_and_batch()
     args.wavelet_loss_rectified_flow = True
     pred = target + 0.1 * torch.randn_like(target)
     output = DiTOutput(pred=pred, target=target, extra={"noisy_model_input": noisy})
@@ -256,7 +256,7 @@ def test_compute_loss_rectified_flow_passes_x0():
 
 
 def test_compute_loss_velocity_space_passes_raw_pred():
-    trainer, args, latents, noise, noisy, target, timesteps, scheduler, sigma = _setup_trainer_and_batch()
+    trainer, args, _latents, _noise, noisy, target, timesteps, scheduler, _sigma = _setup_trainer_and_batch()
     args.wavelet_loss_rectified_flow = False
     pred = target + 0.1 * torch.randn_like(target)
     output = DiTOutput(pred=pred, target=target, extra={"noisy_model_input": noisy})
@@ -300,8 +300,9 @@ def test_extra_metadata_disabled():
 
 
 def test_combined_parser_has_common_and_wavelet_args():
-    from musubi_tuner.hv_train_network import setup_parser_common
     from musubi_tuner.flux_2_train_network import flux2_setup_parser
+    from musubi_tuner.hv_train_network import setup_parser_common
+
     from boo_musubi_tuner.wavelet_loss.flux_2_train_network_wavelet_loss import wavelet_loss_setup_parser
 
     parser = wavelet_loss_setup_parser(flux2_setup_parser(setup_parser_common()))
