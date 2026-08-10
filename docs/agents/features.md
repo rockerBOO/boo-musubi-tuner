@@ -48,8 +48,10 @@ Add `docs/<extension>.md` with:
 - A flags table (flag, default, meaning).
 - Any known limitations or compatibility gaps.
 
-Then add one line to README.md's Extensions list linking to the new doc, and one bullet to CLAUDE.md's
-Extensions list (short — implementation detail belongs in the doc, not CLAUDE.md).
+Then add one line to README.md's Extensions list linking to the new doc. If the extension has non-obvious
+implementation internals (hook mechanics, composability gaps, etc.) worth flagging for future agent work, add a
+section to [docs/agents/extension-internals.md](extension-internals.md) — keep CLAUDE.md itself free of
+model/feature-specific detail.
 
 ## 4. Before committing
 
