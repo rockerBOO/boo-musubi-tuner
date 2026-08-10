@@ -1,0 +1,47 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout musubi-tuner (rockerBOO fork)
+        uses: actions/checkout@v7
+        with:
+          repository: rockerBOO/musubi-tuner
+          ref: compute-loss-reduction
+          path: others/musubi-tuner
+
+      - name: Checkout boo-musubi-tuner
+        uses: actions/checkout@v7
+        with:
+          path: boo-musubi-tuner
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libgl1 libglib2.0-0 libsm6 libxext6 libxrender1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v8.2.0
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version-file: boo-musubi-tuner/.python-version
+
+      - name: Install the project
+        run: uv sync
+        working-directory: boo-musubi-tuner
+
+      - name: Lint
+        run: |
+          uv run ruff check .
+          uv run ruff format --check .
+        working-directory: boo-musubi-tuner
+
+      - name: Run tests
+        run: uv run pytest
+        working-directory: boo-musubi-tuner
