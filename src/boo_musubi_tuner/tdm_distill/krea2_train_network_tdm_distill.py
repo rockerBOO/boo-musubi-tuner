@@ -95,10 +95,6 @@ class Krea2TdmDistillNetworkTrainer(Krea2NetworkTrainer):
         self._fake_score_optimizer = accelerator.prepare(self._fake_score_optimizer)
 
         self._dinov3_embedder = None
-        if args.tdm_diversity_weight > 0.0:
-            from boo_musubi_tuner.tdm_distill.tdm_distill import Dinov3ImageEmbedder
-
-            self._dinov3_embedder = Dinov3ImageEmbedder(device=str(accelerator.device))
 
         logger.info(
             f"TDM distillation enabled: step_counts={args.tdm_step_counts}, "
@@ -282,7 +278,12 @@ class Krea2TdmDistillNetworkTrainer(Krea2NetworkTrainer):
             "tdm/interval": float(interval),
         }
 
-        if self._dinov3_embedder is not None and vae is not None:
+        if args.tdm_diversity_weight > 0.0 and vae is not None:
+            if self._dinov3_embedder is None:
+                from boo_musubi_tuner.tdm_distill.tdm_distill import Dinov3ImageEmbedder
+
+                self._dinov3_embedder = Dinov3ImageEmbedder(device=str(accelerator.device))
+
             group_trajectory, _ = self._student_rollout(
                 args,
                 accelerator,
