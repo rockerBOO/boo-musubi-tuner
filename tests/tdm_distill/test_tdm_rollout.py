@@ -31,6 +31,31 @@ def test_student_rollout_returns_correct_lengths_and_finite(tiny_k2_model):
         assert torch.isfinite(x).all()
 
 
+def test_student_rollout_uses_batch_latent_resolution(tiny_k2_model):
+    """Regression: the rollout used to hardcode 8x8 latents, ignoring the batch's real size."""
+    torch.manual_seed(0)
+    trainer = Krea2TdmDistillNetworkTrainer()
+    acc = FakeAccelerator()
+    batch, _, _ = make_k2_batch(B=1, H=12, W=16, n_txt=3)
+
+    class DummyArgs:
+        gradient_checkpointing = False
+
+    trajectory, _ = trainer._student_rollout(
+        DummyArgs(),
+        acc,
+        tiny_k2_model,
+        batch,
+        num_steps=2,
+        grad_from_step=2,
+        device="cpu",
+        dit_dtype=torch.float32,
+        network_dtype=torch.float32,
+    )
+    for x in trajectory:
+        assert x.shape[-2:] == (12, 16)
+
+
 def test_student_rollout_no_grad_before_grad_from_step(tiny_k2_model):
     torch.manual_seed(0)
     trainer = Krea2TdmDistillNetworkTrainer()

@@ -17,6 +17,9 @@ def make_args(**overrides):
     args = parser.parse_args([])
     args.tdm_distill = True
     args.tdm_turbo_lora_init = "/mnt/900/lora/krea2/krea2_turbo_lora_rank_64_bf16.safetensors"
+    # Required by default since the default diversity weight is > 0 (the VAE is only loaded when
+    # sampling is configured).
+    args.sample_prompts = "prompts.txt"
     for k, v in overrides.items():
         setattr(args, k, v)
     return args
@@ -62,3 +65,29 @@ def test_zero_diversity_weight_warns_not_raises(caplog):
     with caplog.at_level("WARNING"):
         trainer.handle_model_specific_args(args)
     assert any("tdm_diversity_weight" in rec.message for rec in caplog.records)
+
+
+def test_missing_sample_prompts_raises_when_diversity_enabled():
+    trainer = Krea2TdmDistillNetworkTrainer()
+    args = make_args(sample_prompts=None)
+    with pytest.raises(ValueError, match="sample_prompts"):
+        trainer.handle_model_specific_args(args)
+
+
+def test_missing_sample_prompts_ok_when_diversity_disabled():
+    trainer = Krea2TdmDistillNetworkTrainer()
+    args = make_args(sample_prompts=None, tdm_diversity_weight=0.0)
+    trainer.handle_model_specific_args(args)
+
+
+def test_gradient_accumulation_above_one_raises():
+    trainer = Krea2TdmDistillNetworkTrainer()
+    args = make_args(gradient_accumulation_steps=2)
+    with pytest.raises(ValueError, match="gradient_accumulation_steps"):
+        trainer.handle_model_specific_args(args)
+
+
+def test_gradient_accumulation_above_one_ok_when_tdm_distill_off():
+    trainer = Krea2TdmDistillNetworkTrainer()
+    args = make_args(tdm_distill=False, gradient_accumulation_steps=2)
+    trainer.handle_model_specific_args(args)

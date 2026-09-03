@@ -61,6 +61,19 @@ class Krea2TdmDistillNetworkTrainer(Krea2NetworkTrainer):
                 f"--tdm_diversity_group_size ({args.tdm_diversity_group_size}) must be >= 2 "
                 "(pairwise diversity is undefined for fewer than 2 samples)."
             )
+        if args.gradient_accumulation_steps != 1:
+            raise ValueError(
+                f"--gradient_accumulation_steps ({args.gradient_accumulation_steps}) must be 1 when --tdm_distill is set. "
+                "The student and the fake-score critic share the same LoRA parameters across two separately prepared "
+                "optimizers, so the critic's mid-accumulation zero_grad() would wipe the student's accumulating grads."
+            )
+        if args.tdm_diversity_weight > 0.0 and not args.sample_prompts:
+            raise ValueError(
+                "--sample_prompts is required when --tdm_distill is set with --tdm_diversity_weight > 0. "
+                "The base trainer only loads the VAE when sampling is configured, and the diversity term needs "
+                "the VAE to decode latents to pixels. Point it at any prompt file (a minimal one is fine); "
+                "this is about VAE availability, not about wanting sample images."
+            )
         if args.tdm_diversity_weight == 0.0:
             logger.warning(
                 "--tdm_diversity_weight is 0.0: TDM will train with no diversity term at all "
@@ -155,9 +168,9 @@ class Krea2TdmDistillNetworkTrainer(Krea2NetworkTrainer):
         super().on_post_save(args, accelerator, network, transformer, ckpt_name, save_dtype, metadata, force_sync_upload)
         if not args.tdm_distill:
             return
-        # process_batch always leaves the student role active on return, so this is a no-op
-        # safety assertion in the common case, not an active swap. The fake-score critic is a
-        # training-only auxiliary network and must never end up in a saved checkpoint.
+        # This hook fires after the checkpoint is already written, so it cannot protect the save
+        # itself. It is state hygiene: leave the student role active for whatever runs next.
+        # process_batch already guarantees that, so this is normally a no-op.
         self._role_switcher.use_student()
 
     def _student_rollout(
@@ -180,7 +193,8 @@ class Krea2TdmDistillNetworkTrainer(Krea2NetworkTrainer):
         patch = model.config.patch
         vl_embed = batch["krea2_vl_embed"]
         bsize = len(vl_embed)
-        lat_h, lat_w = 8, 8  # caller-provided batches are already at their target latent size
+        # Latents are (B, C, T, H, W) for K2 (single frame, T=1), so H/W are the last two dims.
+        lat_h, lat_w = batch["latents"].shape[-2], batch["latents"].shape[-1]
 
         noise = torch.randn(bsize, model.config.channels, 1, lat_h, lat_w, device=device, dtype=dit_dtype)
         imglen = (lat_h // patch) * (lat_w // patch)
@@ -305,6 +319,9 @@ class Krea2TdmDistillNetworkTrainer(Krea2NetworkTrainer):
             fake_score_updated = self.call_dit(
                 args, accelerator, transformer, x_tau, batch, fresh_noise, x_tau, timesteps_tau, network_dtype
             ).pred
+        # Negative on purpose: krea2_sampling.timesteps runs 1 -> 0, so t_i_plus_1 < t_i. That sign is
+        # what reconciles velocity-space predictions with the score-space convention TDM's revised
+        # target is written in. Do not "fix" it to abs() or a swapped subtraction.
         lambda_tau = t_i_plus_1 - t_i
         x_revised = revised_sample(x_ti.detach(), real_score, fake_score_updated, lambda_tau).detach()
 

@@ -55,9 +55,10 @@ separately), backward/stepped manually inside `process_batch` — the only exten
 more than one live optimizer. `process_batch` must always leave the LoRA network on its **student**
 role when it returns, since the base trainer's outer loop calls `accelerator.backward`/
 `optimizer.step()` on whatever `network`'s current live weights are. `on_post_save` reasserts this
-(`switcher.use_student()`) as a cheap safety net before the base trainer's own save runs, so the
-fake-score critic — a training-only auxiliary network, never meant to ship — can never leak into a
-saved checkpoint even if a future change to `process_batch` breaks the invariant above.
+(`switcher.use_student()`), but note that hook fires *after* the checkpoint file is already written,
+so it is post-save state hygiene for whatever runs next — not a save-time safety net. Keeping the
+fake-score critic (a training-only auxiliary network) out of saved checkpoints depends entirely on
+`process_batch` holding the invariant above.
 
 **The DINOv3 diversity term is a real, fully differentiable training signal**, not a passive metric
 computed for logging. `Dinov3ImageEmbedder.embed_differentiable` (`tdm_distill.py`) deliberately

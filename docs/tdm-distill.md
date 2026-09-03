@@ -19,6 +19,7 @@ accelerate launch src/boo_musubi_tuner/tdm_distill/krea2_train_network_tdm_disti
   --dit /path/to/krea2_raw.safetensors \
   --vae /path/to/qwen_image_vae.safetensors \
   --text_encoder /path/to/qwen3_vl_text_encoder.safetensors \
+  --sample_prompts /path/to/prompts.txt \
   --tdm_distill \
   --tdm_turbo_lora_init /mnt/900/lora/krea2/krea2_turbo_lora_rank_64_bf16.safetensors \
   --tdm_step_counts 1,2,4,8 \
@@ -26,6 +27,10 @@ accelerate launch src/boo_musubi_tuner/tdm_distill/krea2_train_network_tdm_disti
   --tdm_diversity_group_size 4 \
   ... (usual musubi-tuner LoRA training flags)
 ```
+
+`--sample_prompts` is required whenever `--tdm_diversity_weight > 0`: the base trainer only loads
+the VAE when sampling is configured, and the diversity term needs the VAE to decode latents to
+pixels. Any prompt file works, even a minimal one.
 
 ## Flags
 
@@ -57,6 +62,15 @@ the student learns — it is not a passive/logging-only metric computed on the s
 - **Two-optimizer training loop**: the fake-score critic is trained by an extension-owned second
   optimizer, stepped manually inside `process_batch`, not through the base trainer's normal
   optimizer lifecycle.
+- **No gradient accumulation**: `--gradient_accumulation_steps` must be 1. The student and the
+  fake-score critic share one physical LoRA network across two separately `prepare`d optimizers, so
+  the critic's mid-accumulation `zero_grad()` would wipe the student's accumulating gradients.
+- **Single-GPU bf16 only**: two `accelerator.prepare`d optimizers sharing one `GradScaler` under fp16
+  mixed precision, or running under multi-GPU/DDP, is untested and likely broken (the extra backward
+  pass per step confuses DDP's gradient reducer, and fp16 grad scaling gets double-updated).
+- **Teacher does no CFG**: the teacher role (multiplier-0 LoRA) runs a single plain conditional
+  forward — no unconditional branch, no guidance scale. This is a known deviation from the design
+  intent of the teacher representing K2 raw's true CFG-guided behavior.
 - **Simplified TDM math**: `fake_score_denoising_loss` implements a plain weighted MSE, not the
   paper's full importance-sampling-reweighted Eq. 7. Treat this as an approximation.
 - **Not annealed**: `--tdm_diversity_weight` should be left constant throughout training — Krea's
