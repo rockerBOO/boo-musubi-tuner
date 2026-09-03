@@ -75,3 +75,63 @@ def pairwise_cosine_diversity(embeddings: torch.Tensor) -> float:
     pair_sims = sim_matrix[triu_indices[0], triu_indices[1]]
     distances = 1.0 - pair_sims
     return distances.mean().item()
+
+
+class LoraRoleSwitcher:
+    """Swaps one physical LoRA network between teacher/student/fake-score roles.
+
+    Teacher = the network's multiplier forced to 0 (zero-cost — no weight copy, the wrapped
+    transformer's forward reduces to its frozen raw base behavior). Student and fake-score are
+    two independent trainable weight states of the *same* LoRA modules, held here and swapped
+    into the network's live state_dict via load_state_dict immediately before each forward —
+    the same trick self_flow's Krea2SelfFlowNetworkTrainer uses for its EMA teacher, extended
+    from two states to three roles.
+    """
+
+    def __init__(self, network) -> None:
+        self._network = network
+        self._student_state: dict | None = None
+        self._fake_score_state: dict | None = None
+        self._active: str | None = None  # "student" | "fake_score" | None (teacher/uninitialized)
+
+    def init_from(self, source_state: dict) -> None:
+        """Seed both student and fake-score states from a shared warm start (the Turbo LoRA)."""
+        self._student_state = {k: v.detach().clone() for k, v in source_state.items()}
+        self._fake_score_state = {k: v.detach().clone() for k, v in source_state.items()}
+
+    def use_teacher(self) -> None:
+        self._sync_active_out()
+        self._network.set_multiplier(0.0)
+        self._active = None
+
+    def use_student(self) -> None:
+        self._sync_active_out()
+        self._network.load_state_dict(self._student_state)
+        self._network.set_multiplier(1.0)
+        self._active = "student"
+
+    def use_fake_score(self) -> None:
+        self._sync_active_out()
+        self._network.load_state_dict(self._fake_score_state)
+        self._network.set_multiplier(1.0)
+        self._active = "fake_score"
+
+    @property
+    def student_state(self) -> dict:
+        if self._active == "student":
+            self._sync_active_out()
+        return self._student_state
+
+    @property
+    def fake_score_state(self) -> dict:
+        if self._active == "fake_score":
+            self._sync_active_out()
+        return self._fake_score_state
+
+    def _sync_active_out(self) -> None:
+        """Write the currently-live weights back into their owning state dict before swapping
+        away, so in-place optimizer updates made while a role was active are not lost."""
+        if self._active == "student":
+            self._student_state = {k: v.detach().clone() for k, v in self._network.state_dict().items()}
+        elif self._active == "fake_score":
+            self._fake_score_state = {k: v.detach().clone() for k, v in self._network.state_dict().items()}
