@@ -10,10 +10,13 @@ known simplifications vs. the paper.
 """
 
 import argparse
+import itertools
 import logging
 
+import torch
 from accelerate import Accelerator
 from musubi_tuner.hv_train_network import read_config_from_file, setup_parser_common
+from musubi_tuner.krea2 import krea2_sampling
 from musubi_tuner.krea2_train_network import Krea2NetworkTrainer, krea2_setup_parser
 
 from boo_musubi_tuner.tdm_distill.tdm_distill import LoraRoleSwitcher
@@ -100,6 +103,48 @@ class Krea2TdmDistillNetworkTrainer(Krea2NetworkTrainer):
             }
         )
         return metadata
+
+    def _student_rollout(
+        self,
+        args,
+        accelerator: Accelerator,
+        transformer,
+        batch: dict,
+        num_steps: int,
+        grad_from_step: int,
+        device,
+        dit_dtype,
+        network_dtype,
+    ) -> "tuple[list, list[float]]":
+        """K-step Euler trajectory from noise, using self.call_dit at each step so the
+        currently-active LoRA role (staged externally via LoraRoleSwitcher) is respected.
+        Steps before grad_from_step run under no_grad (cheap — most of the trajectory only
+        needs to exist to reach the sampled interval, not to be differentiated through)."""
+        model = accelerator.unwrap_model(transformer)
+        patch = model.config.patch
+        vl_embed = batch["krea2_vl_embed"]
+        bsize = len(vl_embed)
+        lat_h, lat_w = 8, 8  # caller-provided batches are already at their target latent size
+
+        noise = torch.randn(bsize, model.config.channels, 1, lat_h, lat_w, device=device, dtype=dit_dtype)
+        imglen = (lat_h // patch) * (lat_w // patch)
+        x1 = (256 // (8 * patch)) ** 2
+        x2 = (1280 // (8 * patch)) ** 2
+        ts = krea2_sampling.timesteps(imglen, num_steps, x1, x2, y1=0.5, y2=1.15, mu=1.15)
+
+        img = noise
+        trajectory = [img]
+        for step_idx, (tcurr, tprev) in enumerate(itertools.pairwise(ts)):
+            grad_ctx = torch.enable_grad() if step_idx >= grad_from_step else torch.no_grad()
+            timesteps_t = torch.full((bsize,), tcurr * 1000.0, device=device, dtype=torch.float32)
+            with grad_ctx:
+                output = self.call_dit(args, accelerator, transformer, img, batch, noise, img, timesteps_t, network_dtype)
+                # call_dit's DiTOutput.pred is the model's direct velocity prediction (not yet
+                # compared to target = noise - latents), so integrate it directly on img — matches
+                # do_inference's own `img = img + (tprev - tcurr) * v` in krea2_train_network.py.
+                img = img + (tprev - tcurr) * output.pred
+            trajectory.append(img)
+        return trajectory, list(ts)
 
 
 def tdm_distill_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
