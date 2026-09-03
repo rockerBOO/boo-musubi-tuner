@@ -21,6 +21,7 @@ from musubi_tuner.krea2_train_network import Krea2NetworkTrainer, krea2_setup_pa
 
 from boo_musubi_tuner.tdm_distill.tdm_distill import (
     LoraRoleSwitcher,
+    diversity_loss_from_embeddings,
     fake_score_denoising_loss,
     pseudo_huber_c,
     pseudo_huber_loss,
@@ -38,6 +39,7 @@ class Krea2TdmDistillNetworkTrainer(Krea2NetworkTrainer):
         super().__init__()
         self._role_switcher: LoraRoleSwitcher | None = None
         self._fake_score_optimizer = None
+        self._dinov3_embedder = None
 
     def handle_model_specific_args(self, args: argparse.Namespace) -> None:
         super().handle_model_specific_args(args)
@@ -91,6 +93,12 @@ class Krea2TdmDistillNetworkTrainer(Krea2NetworkTrainer):
         fake_score_args.optimizer_type = args.fake_score_optimizer_type
         _, _, self._fake_score_optimizer, _, _ = self.get_optimizer(fake_score_args, list(unwrapped_nw.parameters()))
         self._fake_score_optimizer = accelerator.prepare(self._fake_score_optimizer)
+
+        self._dinov3_embedder = None
+        if args.tdm_diversity_weight > 0.0:
+            from boo_musubi_tuner.tdm_distill.tdm_distill import Dinov3ImageEmbedder
+
+            self._dinov3_embedder = Dinov3ImageEmbedder(device=str(accelerator.device))
 
         logger.info(
             f"TDM distillation enabled: step_counts={args.tdm_step_counts}, "
@@ -191,6 +199,9 @@ class Krea2TdmDistillNetworkTrainer(Krea2NetworkTrainer):
         device = accelerator.device
         switcher = self._role_switcher
 
+        group_size = args.tdm_diversity_group_size
+        single_prompt_batch = {"krea2_vl_embed": [batch["krea2_vl_embed"][0]] * group_size}
+
         # Draw from the global RNG (generator=None): a freshly constructed torch.Generator has a
         # fixed default seed, so building one per call would pick the *same* K and interval on
         # every training step. The global RNG still honours the run's torch.manual_seed.
@@ -264,13 +275,44 @@ class Krea2TdmDistillNetworkTrainer(Krea2NetworkTrainer):
         data_dim = x_ti.shape[1:].numel()
         loss = pseudo_huber_loss(x_ti_student, x_revised, c=pseudo_huber_c(data_dim))
 
-        metrics = {
+        loss_metrics = {
             "loss/tdm": loss.detach().item(),
             "loss/fake_score": fake_score_loss.detach().item(),
             "tdm/k": float(num_steps),
             "tdm/interval": float(interval),
         }
-        return loss, metrics
+
+        if self._dinov3_embedder is not None and vae is not None:
+            group_trajectory, _ = self._student_rollout(
+                args,
+                accelerator,
+                transformer,
+                single_prompt_batch,
+                num_steps,
+                grad_from_step=0,
+                device=device,
+                dit_dtype=dit_dtype,
+                network_dtype=network_dtype,
+            )
+            final_latent = group_trajectory[-1]
+            # vae is kept on CPU between uses to save VRAM (see load_vae/on_before_sample_images);
+            # move it onto the training device for this decode, then back, matching the base
+            # trainer's own sample-image decode pattern in krea2_train_network.py.
+            vae.to(device)
+            with torch.no_grad():
+                pixels = vae.decode_to_pixels(final_latent.to(vae.dtype))  # (group_size, C, H, W) in [0, 1]
+            vae.to("cpu")
+            images = [
+                torch.clamp(pixels[i].float(), 0.0, 1.0).permute(1, 2, 0).mul(255).byte().cpu().numpy()
+                for i in range(pixels.shape[0])
+            ]
+            embeddings = self._dinov3_embedder.embed(images)
+            div_loss = diversity_loss_from_embeddings(embeddings)
+            loss = loss + args.tdm_diversity_weight * div_loss
+            loss_metrics["loss/diversity"] = div_loss
+            loss_metrics["tdm/diversity_score"] = -div_loss
+
+        return loss, loss_metrics
 
 
 def tdm_distill_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:

@@ -10,6 +10,7 @@ docs/tdm-distill.md for known simplifications vs. the paper.
 import math
 
 import torch
+from transformers import AutoImageProcessor, AutoModel
 
 
 def pseudo_huber_c(data_dim: int) -> float:
@@ -138,3 +139,27 @@ class LoraRoleSwitcher:
             self._student_state = {k: v.detach().clone() for k, v in self._network.state_dict().items()}
         elif self._active == "fake_score":
             self._fake_score_state = {k: v.detach().clone() for k, v in self._network.state_dict().items()}
+
+
+def diversity_loss_from_embeddings(embeddings: torch.Tensor) -> float:
+    """Negated pairwise_cosine_diversity: minimizing this loss maximizes diversity. Used as
+    L_div, added (weighted, not annealed) to the TDM student loss."""
+    return -pairwise_cosine_diversity(embeddings)
+
+
+class Dinov3ImageEmbedder:
+    """Wraps a DINOv3 backbone for image-only embedding extraction (CLS token). Ported from the
+    krea2-diversity probe project's identical class — requires one-time Hugging Face license
+    acceptance for facebook/dinov3-vitb16-pretrain-lvd1689m plus `huggingface-cli login` before
+    first use; no unit test here (integration-only, see docs/tdm-distill.md)."""
+
+    def __init__(self, model_name: str = "facebook/dinov3-vitb16-pretrain-lvd1689m", device: str = "cuda"):
+        self.device = device
+        self.processor = AutoImageProcessor.from_pretrained(model_name)
+        self.model = AutoModel.from_pretrained(model_name).to(device).eval()
+
+    @torch.no_grad()
+    def embed(self, images: list) -> torch.Tensor:
+        inputs = self.processor(images=images, return_tensors="pt").to(self.device)
+        outputs = self.model(**inputs)
+        return outputs.last_hidden_state[:, 0, :].cpu()
