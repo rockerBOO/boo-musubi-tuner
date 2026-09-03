@@ -230,7 +230,8 @@ class Krea2TdmDistillNetworkTrainer(Krea2NetworkTrainer):
         fake_score_pred = self.call_dit(
             args, accelerator, transformer, x_tau, batch, fresh_noise, x_tau, timesteps_tau, network_dtype
         ).pred
-        fake_score_loss = fake_score_denoising_loss(fake_score_pred, x_ti.detach())
+        fake_score_target = (fresh_noise - x_ti.detach()).detach()
+        fake_score_loss = fake_score_denoising_loss(fake_score_pred, fake_score_target)
         accelerator.backward(fake_score_loss)
         self._fake_score_optimizer.step()
         self._fake_score_optimizer.zero_grad(set_to_none=True)
