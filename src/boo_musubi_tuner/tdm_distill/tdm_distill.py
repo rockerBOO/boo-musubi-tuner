@@ -47,3 +47,31 @@ def fake_score_denoising_loss(
     target. omega_tau is a plain scalar/per-example weight, not the paper's full importance-
     sampling ratio (documented simplification, see docs/tdm-distill.md)."""
     return (omega_tau * (fake_score_pred - target) ** 2).mean()
+
+
+def sample_step_count(step_counts: list[int], generator: "torch.Generator | None" = None) -> int:
+    """Uniformly draw one student sampling-step count K from the configured list (TDM Eq. 8's
+    sampling-steps-aware objective — makes the student usable across multiple step budgets)."""
+    idx = torch.randint(0, len(step_counts), (1,), generator=generator).item()
+    return step_counts[idx]
+
+
+def sample_trajectory_interval(num_steps: int, generator: "torch.Generator | None" = None) -> int:
+    """Uniformly pick one interval index along a num_steps-point trajectory (TDM's non-overlapping
+    interval sampling — a single fake-score forward suffices per training iteration)."""
+    return int(torch.randint(0, num_steps - 1, (1,), generator=generator).item())
+
+
+def pairwise_cosine_diversity(embeddings: torch.Tensor) -> float:
+    """Mean pairwise cosine distance (1 - cosine_similarity) across all unordered pairs of rows
+    in embeddings (N, D). Higher = more diverse. Ported from the krea2-diversity probe project's
+    identical metric (see docs/tdm-distill.md)."""
+    n = embeddings.shape[0]
+    if n < 2:
+        raise ValueError(f"pairwise_cosine_diversity requires N >= 2 embeddings, got N={n}")
+    normed = torch.nn.functional.normalize(embeddings.float(), dim=-1)
+    sim_matrix = normed @ normed.T
+    triu_indices = torch.triu_indices(n, n, offset=1)
+    pair_sims = sim_matrix[triu_indices[0], triu_indices[1]]
+    distances = 1.0 - pair_sims
+    return distances.mean().item()
