@@ -1,12 +1,10 @@
 """TDM diversity-distillation training entry point for Krea 2 (K2).
 
 Implements Trajectory Distribution Matching (TDM, arXiv:2503.06674) on the K2 backbone, with a
-DINOv3 group-diversity term folded into the student loss. See
-docs/superpowers/specs/2026-09-03-krea2-tdm-diversity-distill-design.md for the full design and
-docs/tdm-distill.md for usage/flags/limitations.
+DINOv3 group-diversity term folded into the student loss. See docs/tdm-distill.md for usage,
+flags, and known limitations.
 
-Internal extension point — no API stability guarantees. Experimental: see docs/tdm-distill.md for
-known simplifications vs. the paper.
+Internal extension point — no API stability guarantees. Experimental.
 """
 
 import argparse
