@@ -12,14 +12,22 @@ known simplifications vs. the paper.
 import argparse
 import logging
 
+from accelerate import Accelerator
 from musubi_tuner.hv_train_network import read_config_from_file, setup_parser_common
 from musubi_tuner.krea2_train_network import Krea2NetworkTrainer, krea2_setup_parser
+
+from boo_musubi_tuner.tdm_distill.tdm_distill import LoraRoleSwitcher
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
 
 class Krea2TdmDistillNetworkTrainer(Krea2NetworkTrainer):
+    def __init__(self) -> None:
+        super().__init__()
+        self._role_switcher: LoraRoleSwitcher | None = None
+        self._fake_score_optimizer = None
+
     def handle_model_specific_args(self, args: argparse.Namespace) -> None:
         super().handle_model_specific_args(args)
         if isinstance(args.tdm_step_counts, str):
@@ -42,6 +50,56 @@ class Krea2TdmDistillNetworkTrainer(Krea2NetworkTrainer):
                 "--tdm_diversity_weight is 0.0: TDM will train with no diversity term at all "
                 "(plain step/guidance distillation). This is a valid ablation setting, not an error."
             )
+
+    def on_train_start(
+        self,
+        args: argparse.Namespace,
+        accelerator: Accelerator,
+        network,
+        transformer,
+        optimizer,
+    ) -> None:
+        super().on_train_start(args, accelerator, network, transformer, optimizer)
+        if not args.tdm_distill:
+            return
+
+        unwrapped_nw = accelerator.unwrap_model(network)
+        info = unwrapped_nw.load_weights(args.tdm_turbo_lora_init)
+        accelerator.print(f"loaded Turbo LoRA warm-start weights from {args.tdm_turbo_lora_init}: {info}")
+
+        self._role_switcher = LoraRoleSwitcher(unwrapped_nw)
+        self._role_switcher.init_from(unwrapped_nw.state_dict())
+
+        if args.fake_score_learning_rate is None:
+            args.fake_score_learning_rate = args.learning_rate * 10.0
+        if args.fake_score_optimizer_type is None:
+            args.fake_score_optimizer_type = args.optimizer_type
+
+        fake_score_args = argparse.Namespace(**vars(args))
+        fake_score_args.learning_rate = args.fake_score_learning_rate
+        fake_score_args.optimizer_type = args.fake_score_optimizer_type
+        _, _, self._fake_score_optimizer, _, _ = self.get_optimizer(fake_score_args, list(unwrapped_nw.parameters()))
+        self._fake_score_optimizer = accelerator.prepare(self._fake_score_optimizer)
+
+        logger.info(
+            f"TDM distillation enabled: step_counts={args.tdm_step_counts}, "
+            f"diversity_weight={args.tdm_diversity_weight}, diversity_group_size={args.tdm_diversity_group_size}, "
+            f"fake_score_lr={args.fake_score_learning_rate}"
+        )
+
+    def extra_metadata(self, args: argparse.Namespace) -> dict:
+        metadata = dict(super().extra_metadata(args))
+        if not args.tdm_distill:
+            return metadata
+        metadata.update(
+            {
+                "ss_tdm_distill": True,
+                "ss_tdm_step_counts": args.tdm_step_counts,
+                "ss_tdm_diversity_weight": args.tdm_diversity_weight,
+                "ss_tdm_diversity_group_size": args.tdm_diversity_group_size,
+            }
+        )
+        return metadata
 
 
 def tdm_distill_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
