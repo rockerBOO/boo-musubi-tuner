@@ -196,7 +196,14 @@ class Krea2TdmDistillNetworkTrainer(Krea2NetworkTrainer):
         switcher = self._role_switcher
 
         group_size = args.tdm_diversity_group_size
-        single_prompt_batch = {"krea2_vl_embed": [batch["krea2_vl_embed"][0]] * group_size}
+        # call_dit reads batch["latents"] directly (to derive bsize and the flow-matching
+        # target), so single_prompt_batch needs its own group_size-sized latents, not just the
+        # text embedding -- repeating a batch-size-1 latents tensor against group_size text
+        # embeddings would raise KeyError (missing key) or a shape mismatch (wrong size).
+        single_prompt_batch = {
+            "krea2_vl_embed": [batch["krea2_vl_embed"][0]] * group_size,
+            "latents": batch["latents"][:1].repeat(group_size, *([1] * (batch["latents"].dim() - 1))),
+        }
 
         # Draw from the global RNG (generator=None): a freshly constructed torch.Generator has a
         # fixed default seed, so building one per call would pick the *same* K and interval on
@@ -284,30 +291,36 @@ class Krea2TdmDistillNetworkTrainer(Krea2NetworkTrainer):
 
                 self._dinov3_embedder = Dinov3ImageEmbedder(device=str(accelerator.device))
 
-            group_trajectory, _ = self._student_rollout(
-                args,
-                accelerator,
-                transformer,
-                single_prompt_batch,
-                num_steps,
-                grad_from_step=0,
-                device=device,
-                dit_dtype=dit_dtype,
-                network_dtype=network_dtype,
-            )
-            final_latent = group_trajectory[-1]
-            # vae is kept on CPU between uses to save VRAM (see load_vae/on_before_sample_images);
-            # move it onto the training device for this decode, then back, matching the base
-            # trainer's own sample-image decode pattern in krea2_train_network.py.
-            vae.to(device)
+            # None of this (rollout, VAE decode, DINOv3 embed) needs to carry gradient: the
+            # embedder is @torch.no_grad() internally and its output is later converted to a
+            # numpy uint8 image, severing autograd well before any grad could reach the rollout.
+            # grad_from_step=num_steps matches _student_rollout's own "no grad needed" convention
+            # (see step 1's rollout above); the outer no_grad() is redundant with that but kept
+            # for clarity/safety against future edits to this block.
             with torch.no_grad():
+                group_trajectory, _ = self._student_rollout(
+                    args,
+                    accelerator,
+                    transformer,
+                    single_prompt_batch,
+                    num_steps,
+                    grad_from_step=num_steps,
+                    device=device,
+                    dit_dtype=dit_dtype,
+                    network_dtype=network_dtype,
+                )
+                final_latent = group_trajectory[-1]
+                # vae is kept on CPU between uses to save VRAM (see load_vae/on_before_sample_images);
+                # move it onto the training device for this decode, then back, matching the base
+                # trainer's own sample-image decode pattern in krea2_train_network.py.
+                vae.to(device)
                 pixels = vae.decode_to_pixels(final_latent.to(vae.dtype))  # (group_size, C, H, W) in [0, 1]
-            vae.to("cpu")
-            images = [
-                torch.clamp(pixels[i].float(), 0.0, 1.0).permute(1, 2, 0).mul(255).byte().cpu().numpy()
-                for i in range(pixels.shape[0])
-            ]
-            embeddings = self._dinov3_embedder.embed(images)
+                vae.to("cpu")
+                images = [
+                    torch.clamp(pixels[i].float(), 0.0, 1.0).permute(1, 2, 0).mul(255).byte().cpu().numpy()
+                    for i in range(pixels.shape[0])
+                ]
+                embeddings = self._dinov3_embedder.embed(images)
             div_loss = diversity_loss_from_embeddings(embeddings)
             loss = loss + args.tdm_diversity_weight * div_loss
             loss_metrics["loss/diversity"] = div_loss
