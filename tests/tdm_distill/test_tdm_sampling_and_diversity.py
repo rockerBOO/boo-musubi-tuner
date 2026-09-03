@@ -35,6 +35,10 @@ def test_sample_trajectory_interval_two_steps_only_zero():
     assert sample_trajectory_interval(num_steps=2, generator=gen) == 0
 
 
+def test_sample_trajectory_interval_single_step_returns_zero():
+    assert sample_trajectory_interval(num_steps=1) == 0
+
+
 def test_pairwise_cosine_diversity_identical_embeddings_is_zero():
     embeddings = torch.ones(4, 8)
     assert pairwise_cosine_diversity(embeddings) == pytest.approx(0.0, abs=1e-6)
