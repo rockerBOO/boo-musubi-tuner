@@ -40,6 +40,11 @@ class Krea2TdmDistillNetworkTrainer(Krea2NetworkTrainer):
         self._role_switcher: LoraRoleSwitcher | None = None
         self._fake_score_optimizer = None
         self._dinov3_embedder = None
+        # Set when process_batch moved the VAE onto the training device for a grad-enabled
+        # decode; consumed by on_post_optimizer_step (see the comment in process_batch).
+        self._vae_ref = None
+        self._vae_needs_cpu_return = False
+        self._vae_frozen = False
 
     def handle_model_specific_args(self, args: argparse.Namespace) -> None:
         super().handle_model_specific_args(args)
@@ -101,6 +106,28 @@ class Krea2TdmDistillNetworkTrainer(Krea2NetworkTrainer):
             f"diversity_weight={args.tdm_diversity_weight}, diversity_group_size={args.tdm_diversity_group_size}, "
             f"fake_score_lr={args.fake_score_learning_rate}"
         )
+
+    def on_post_optimizer_step(
+        self,
+        args: argparse.Namespace,
+        accelerator: Accelerator,
+        network,
+        transformer,
+        sync_gradients: bool,
+        global_step: int,
+    ) -> None:
+        super().on_post_optimizer_step(args, accelerator, network, transformer, sync_gradients, global_step)
+        if not args.tdm_distill:
+            return
+        # process_batch's diversity block leaves the VAE on the training device because its decode
+        # is grad-enabled and the outer loop's backward() runs after process_batch returns. By now
+        # backward() and the optimizer step are done and the graph is dead, so it is safe to hand
+        # the VAE's VRAM back.
+        if self._vae_needs_cpu_return:
+            if self._vae_ref is not None:
+                self._vae_ref.to("cpu")
+            self._vae_ref = None
+            self._vae_needs_cpu_return = False
 
     def extra_metadata(self, args: argparse.Namespace) -> dict:
         metadata = dict(super().extra_metadata(args))
@@ -311,12 +338,28 @@ class Krea2TdmDistillNetworkTrainer(Krea2NetworkTrainer):
                 network_dtype=network_dtype,
             )
             final_latent = group_trajectory[-1]
+            # The VAE's own params are never trained and belong to no optimizer, but this decode
+            # runs with grad enabled, so without freezing them every backward() would accumulate
+            # (and permanently hold) a .grad buffer on each one. Freeze once, lazily: on_train_start
+            # is not handed the vae, so first use here is the earliest hook that has it.
+            if not self._vae_frozen and hasattr(vae, "parameters"):
+                for p in vae.parameters():
+                    p.requires_grad_(False)
+                self._vae_frozen = True
+
             # vae is kept on CPU between uses to save VRAM (see load_vae/on_before_sample_images);
-            # move it onto the training device for this decode, then back, matching the base
-            # trainer's own sample-image decode pattern in krea2_train_network.py.
+            # move it onto the training device for this decode. Unlike the base trainer's
+            # sample-image decode (krea2_train_network.py), we must NOT move it straight back to
+            # CPU: this decode is grad-enabled and nn.Module.to() rebinds param.data in place on
+            # the very tensors autograd saved for backward. The outer loop's accelerator.backward()
+            # runs *after* process_batch returns, so a CPU round-trip here would crash with a
+            # device mismatch. Instead the VAE stays resident on the training device for the rest
+            # of the step (extra VRAM cost while the diversity term is enabled) and is returned to
+            # CPU in on_post_optimizer_step, once backward has consumed the graph.
             vae.to(device)
             pixels = vae.decode_to_pixels(final_latent.to(vae.dtype))  # (group_size, C, H, W) in [0, 1]
-            vae.to("cpu")
+            self._vae_ref = vae
+            self._vae_needs_cpu_return = True
             pixel_batch = torch.clamp(pixels.float(), 0.0, 1.0)
             embeddings = self._dinov3_embedder.embed_differentiable(pixel_batch)
             div_loss = diversity_loss_from_embeddings(embeddings)

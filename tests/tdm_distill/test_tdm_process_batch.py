@@ -1,4 +1,5 @@
 import torch
+from musubi_tuner.krea2.krea2_mmdit import SingleStreamDiT
 from musubi_tuner.modules.scheduling_flow_match_discrete import FlowMatchDiscreteScheduler
 
 from boo_musubi_tuner.tdm_distill.krea2_train_network_tdm_distill import Krea2TdmDistillNetworkTrainer
@@ -38,13 +39,13 @@ def _prepared_trainer(tiny_k2_model, **arg_overrides):
     net.load_weights = lambda path: "ok"
     trainer.handle_model_specific_args(args)
     trainer.on_train_start(args, acc, net, tiny_k2_model, None)
-    _attach_stub_lora(tiny_k2_model, net)
-    return trainer, args, acc, net
+    handle = _attach_stub_lora(tiny_k2_model, net)
+    return trainer, args, acc, net, handle
 
 
 def test_process_batch_tdm_smoke(tiny_k2_model):
     torch.manual_seed(0)
-    trainer, args, acc, net = _prepared_trainer(tiny_k2_model)
+    trainer, args, acc, net, _handle = _prepared_trainer(tiny_k2_model)
     for p in tiny_k2_model.parameters():
         p.requires_grad_(True)
     batch, latents, noise = make_k2_batch(B=1, H=8, W=8, n_txt=3)
@@ -62,7 +63,7 @@ def test_process_batch_tdm_smoke(tiny_k2_model):
 
 def test_process_batch_fake_score_optimizer_stepped(tiny_k2_model):
     torch.manual_seed(1)
-    trainer, args, acc, net = _prepared_trainer(tiny_k2_model)
+    trainer, args, acc, net, _handle = _prepared_trainer(tiny_k2_model)
     for p in tiny_k2_model.parameters():
         p.requires_grad_(True)
     batch, latents, noise = make_k2_batch(B=1, H=8, W=8, n_txt=3)
@@ -80,7 +81,7 @@ def test_process_batch_leaves_student_role_active(tiny_k2_model):
     """process_batch must return with the student role live: the base trainer's outer loop
     backward()/optimizer.step() operates on whatever weights are currently on `net`."""
     torch.manual_seed(2)
-    trainer, args, acc, net = _prepared_trainer(tiny_k2_model)
+    trainer, args, acc, net, _handle = _prepared_trainer(tiny_k2_model)
     for p in tiny_k2_model.parameters():
         p.requires_grad_(True)
     batch, latents, noise = make_k2_batch(B=1, H=8, W=8, n_txt=3)
@@ -98,7 +99,7 @@ def test_process_batch_resamples_step_count_across_calls(tiny_k2_model):
     torch.Generator carries a fixed default seed, so per-call generator construction would
     silently pin K (and the interval) to the same value on every training step."""
     torch.manual_seed(4)
-    trainer, args, acc, net = _prepared_trainer(tiny_k2_model)
+    trainer, args, acc, net, _handle = _prepared_trainer(tiny_k2_model)
     for p in tiny_k2_model.parameters():
         p.requires_grad_(True)
     batch, latents, noise = make_k2_batch(B=1, H=8, W=8, n_txt=3)
@@ -145,11 +146,21 @@ class _StubDinov3Embedder:
         return flat[:, :8] + flat.mean(dim=1, keepdim=True)
 
 
-def _run_diversity_process_batch(tiny_k2_model, seed, **arg_overrides):
+def _run_diversity_process_batch(tiny_k2_config, seed, **arg_overrides):
     """One seeded process_batch call through the diversity block, returning
-    (loss, metrics, net, rollout_calls)."""
+    (loss, metrics, net, rollout_calls).
+
+    Builds its OWN model from the config rather than taking the shared `tiny_k2_model` fixture:
+    callers compare two runs at the same seed, and reusing one model instance would stack a
+    second `_attach_stub_lora` forward hook on the second run — the runs would then differ
+    because of hook contamination rather than the effect under test. Seeding before
+    construction means both models start from identical weights. The hook is removed after the
+    call for good measure.
+    """
     torch.manual_seed(seed)
-    trainer, args, acc, net = _prepared_trainer(tiny_k2_model, tdm_diversity_group_size=3, **arg_overrides)
+    tiny_k2_model = SingleStreamDiT(tiny_k2_config, attn_mode="torch")
+    tiny_k2_model.eval()
+    trainer, args, acc, net, handle = _prepared_trainer(tiny_k2_model, tdm_diversity_group_size=3, **arg_overrides)
     for p in tiny_k2_model.parameters():
         p.requires_grad_(True)
     trainer._dinov3_embedder = _StubDinov3Embedder()
@@ -170,17 +181,18 @@ def _run_diversity_process_batch(tiny_k2_model, seed, **arg_overrides):
     loss, metrics = trainer.process_batch(
         args, acc, tiny_k2_model, net, batch, latents, noise, scheduler, torch.float32, torch.float32, vae, global_step=0
     )
+    handle.remove()
     return loss, metrics, net, rollout_calls
 
 
-def test_process_batch_diversity_term_gradient_flows_to_student(tiny_k2_model):
+def test_process_batch_diversity_term_gradient_flows_to_student(tiny_k2_config):
     """Exercises the diversity block (vae is not None) end-to-end with stub VAE/embedder.
 
     Confirms: no KeyError/IndexError from single_prompt_batch's missing/mis-sized "latents";
     the diversity metrics land in the returned dict as plain floats (not graph-carrying
     tensors); and — the point of the term — the whole rollout -> VAE decode -> embed ->
     diversity-loss chain is differentiable, so gradient reaches the student LoRA parameter."""
-    loss, metrics, net, rollout_calls = _run_diversity_process_batch(tiny_k2_model, seed=5)
+    loss, metrics, net, rollout_calls = _run_diversity_process_batch(tiny_k2_config, seed=5)
 
     assert loss.ndim == 0 and torch.isfinite(loss)
     assert isinstance(metrics["loss/diversity"], float)
@@ -199,21 +211,21 @@ def test_process_batch_diversity_term_gradient_flows_to_student(tiny_k2_model):
     assert net.lora_w.grad is not None
 
 
-def test_process_batch_diversity_weight_changes_student_gradient(tiny_k2_model):
+def test_process_batch_diversity_weight_changes_student_gradient(tiny_k2_config):
     """Stronger guard that the diversity term is a live training signal and not dead weight:
     at the same seed, the student LoRA's gradient must differ between diversity_weight=0 (block
     skipped entirely) and a nonzero weight. A non-differentiable diversity path would leave the
     two gradients identical."""
-    loss_off, _, net_off, _ = _run_diversity_process_batch(tiny_k2_model, seed=7, tdm_diversity_weight=0.0)
+    loss_off, _, net_off, _ = _run_diversity_process_batch(tiny_k2_config, seed=7, tdm_diversity_weight=0.0)
     loss_off.backward()
     grad_off = net_off.lora_w.grad.clone()
 
-    loss_on, _, net_on, _ = _run_diversity_process_batch(tiny_k2_model, seed=7, tdm_diversity_weight=1.0)
+    loss_on, _, net_on, _ = _run_diversity_process_batch(tiny_k2_config, seed=7, tdm_diversity_weight=1.0)
     loss_on.backward()
     grad_on = net_on.lora_w.grad.clone()
 
     assert grad_off is not None and grad_on is not None
-    assert not torch.equal(grad_off, grad_on)
+    assert not torch.allclose(grad_off, grad_on)
 
 
 def test_process_batch_vanilla_fallthrough(tiny_k2_model):

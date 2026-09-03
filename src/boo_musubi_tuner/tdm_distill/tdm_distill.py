@@ -170,6 +170,13 @@ class Dinov3ImageEmbedder:
         self.device = device
         self.processor = AutoImageProcessor.from_pretrained(model_name)
         self.model = AutoModel.from_pretrained(model_name).to(device).eval()
+        # embed_differentiable runs without torch.no_grad() (gradient must reach the *input*
+        # pixels), and .eval() does not stop grad accumulation. This backbone is frozen and in no
+        # optimizer, so without requires_grad_(False) every backward would park a permanent .grad
+        # buffer on each parameter (~model-sized leak, nothing ever zeroes it). Freezing the
+        # parameters does not sever the graph through them: autograd still backprops to the input.
+        for p in self.model.parameters():
+            p.requires_grad_(False)
         # Preprocessing params mirrored off the real processor for embed_differentiable's manual
         # tensor path. DINOv3ViTImageProcessorFast exposes size={"height": 224, "width": 224} and
         # crop_size=None; the getattr fallbacks cover processor variants that expose crop_size
