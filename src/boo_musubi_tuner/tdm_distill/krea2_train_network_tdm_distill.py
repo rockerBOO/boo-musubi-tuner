@@ -291,40 +291,39 @@ class Krea2TdmDistillNetworkTrainer(Krea2NetworkTrainer):
 
                 self._dinov3_embedder = Dinov3ImageEmbedder(device=str(accelerator.device))
 
-            # None of this (rollout, VAE decode, DINOv3 embed) needs to carry gradient: the
-            # embedder is @torch.no_grad() internally and its output is later converted to a
-            # numpy uint8 image, severing autograd well before any grad could reach the rollout.
-            # grad_from_step=num_steps matches _student_rollout's own "no grad needed" convention
-            # (see step 1's rollout above); the outer no_grad() is redundant with that but kept
-            # for clarity/safety against future edits to this block.
-            with torch.no_grad():
-                group_trajectory, _ = self._student_rollout(
-                    args,
-                    accelerator,
-                    transformer,
-                    single_prompt_batch,
-                    num_steps,
-                    grad_from_step=num_steps,
-                    device=device,
-                    dit_dtype=dit_dtype,
-                    network_dtype=network_dtype,
-                )
-                final_latent = group_trajectory[-1]
-                # vae is kept on CPU between uses to save VRAM (see load_vae/on_before_sample_images);
-                # move it onto the training device for this decode, then back, matching the base
-                # trainer's own sample-image decode pattern in krea2_train_network.py.
-                vae.to(device)
-                pixels = vae.decode_to_pixels(final_latent.to(vae.dtype))  # (group_size, C, H, W) in [0, 1]
-                vae.to("cpu")
-                images = [
-                    torch.clamp(pixels[i].float(), 0.0, 1.0).permute(1, 2, 0).mul(255).byte().cpu().numpy()
-                    for i in range(pixels.shape[0])
-                ]
-                embeddings = self._dinov3_embedder.embed(images)
+            # This whole chain (rollout -> VAE decode -> DINOv3 embed -> diversity loss) must stay
+            # differentiable: the diversity term is a real training signal, so gradient has to reach
+            # the student LoRA weights. Hence grad_from_step=0 (every rollout step grad-enabled), no
+            # torch.no_grad() around the decode, and embed_differentiable instead of embed() (which
+            # is @torch.no_grad() and takes numpy images — both graph-severing). The VAE's own
+            # params are frozen and in no optimizer, but the decode *operation* still has to run
+            # with grad so pixels carry a graph back to final_latent. Safe to run grad-enabled here
+            # because we are past every LoraRoleSwitcher swap (student role is live from step 5).
+            group_trajectory, _ = self._student_rollout(
+                args,
+                accelerator,
+                transformer,
+                single_prompt_batch,
+                num_steps,
+                grad_from_step=0,
+                device=device,
+                dit_dtype=dit_dtype,
+                network_dtype=network_dtype,
+            )
+            final_latent = group_trajectory[-1]
+            # vae is kept on CPU between uses to save VRAM (see load_vae/on_before_sample_images);
+            # move it onto the training device for this decode, then back, matching the base
+            # trainer's own sample-image decode pattern in krea2_train_network.py.
+            vae.to(device)
+            pixels = vae.decode_to_pixels(final_latent.to(vae.dtype))  # (group_size, C, H, W) in [0, 1]
+            vae.to("cpu")
+            pixel_batch = torch.clamp(pixels.float(), 0.0, 1.0)
+            embeddings = self._dinov3_embedder.embed_differentiable(pixel_batch)
             div_loss = diversity_loss_from_embeddings(embeddings)
             loss = loss + args.tdm_diversity_weight * div_loss
-            loss_metrics["loss/diversity"] = div_loss
-            loss_metrics["tdm/diversity_score"] = -div_loss
+            # div_loss is a graph-carrying tensor; metrics are plain floats by convention.
+            loss_metrics["loss/diversity"] = div_loss.detach().item()
+            loss_metrics["tdm/diversity_score"] = -div_loss.detach().item()
 
         return loss, loss_metrics
 

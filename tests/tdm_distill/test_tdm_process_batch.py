@@ -114,9 +114,10 @@ def test_process_batch_resamples_step_count_across_calls(tiny_k2_model):
 
 
 class _StubVae:
-    """Minimal VAE stand-in: decode_to_pixels ignores its input shape/content and returns a
-    fixed-size pixel tensor, enough to exercise the diversity block's decode->image->embed
-    pipeline without a real autoencoder."""
+    """Minimal VAE stand-in. decode_to_pixels is a cheap but *differentiable* function of the
+    latents (channel-mean -> per-channel scaling -> sigmoid into [0, 1]), so gradient can flow
+    from the decoded pixels back into the rollout that produced the latents — exercising the
+    real decode's graph-carrying behaviour without a real autoencoder."""
 
     dtype = torch.float32
 
@@ -128,26 +129,27 @@ class _StubVae:
         return self
 
     def decode_to_pixels(self, latents: torch.Tensor) -> torch.Tensor:
+        # latents: (N, C, 1, 8, 8) -> (N, 3, 8, 8) in [0, 1], same layout as the real VAE's.
         n = latents.shape[0]
-        return torch.rand(n, 3, 8, 8, dtype=torch.float32)
+        base = latents.reshape(n, -1, 8, 8).mean(dim=1, keepdim=True)
+        return torch.sigmoid(torch.cat([base, base * 0.5, base * 2.0], dim=1))
 
 
 class _StubDinov3Embedder:
-    """Minimal DINOv3 embedder stand-in: returns a fixed-shape embedding per image, avoiding
-    any real model download."""
+    """Minimal DINOv3 embedder stand-in. Deliberately exposes only embed_differentiable (no
+    `embed`), so a regression back to the numpy/no_grad `embed()` path fails loudly here. The
+    embedding is a plain differentiable reduction of the pixel tensor — no model download."""
 
-    def embed(self, images: list) -> torch.Tensor:
-        return torch.randn(len(images), 8)
+    def embed_differentiable(self, pixel_values: torch.Tensor) -> torch.Tensor:
+        flat = pixel_values.reshape(pixel_values.shape[0], -1)
+        return flat[:, :8] + flat.mean(dim=1, keepdim=True)
 
 
-def test_process_batch_diversity_term_end_to_end(tiny_k2_model):
-    """Exercises the diversity block (vae is not None) end-to-end with stub VAE/embedder.
-    Confirms: no KeyError/IndexError from single_prompt_batch's missing/mis-sized "latents"
-    (Bug 1), the diversity metrics land in the returned dict, and the group rollout used for
-    the diversity term does not build an autograd graph (Bug 2: grad_from_step must match
-    num_steps, not 0)."""
-    torch.manual_seed(5)
-    trainer, args, acc, net = _prepared_trainer(tiny_k2_model, tdm_diversity_group_size=3)
+def _run_diversity_process_batch(tiny_k2_model, seed, **arg_overrides):
+    """One seeded process_batch call through the diversity block, returning
+    (loss, metrics, net, rollout_calls)."""
+    torch.manual_seed(seed)
+    trainer, args, acc, net = _prepared_trainer(tiny_k2_model, tdm_diversity_group_size=3, **arg_overrides)
     for p in tiny_k2_model.parameters():
         p.requires_grad_(True)
     trainer._dinov3_embedder = _StubDinov3Embedder()
@@ -168,21 +170,50 @@ def test_process_batch_diversity_term_end_to_end(tiny_k2_model):
     loss, metrics = trainer.process_batch(
         args, acc, tiny_k2_model, net, batch, latents, noise, scheduler, torch.float32, torch.float32, vae, global_step=0
     )
+    return loss, metrics, net, rollout_calls
+
+
+def test_process_batch_diversity_term_gradient_flows_to_student(tiny_k2_model):
+    """Exercises the diversity block (vae is not None) end-to-end with stub VAE/embedder.
+
+    Confirms: no KeyError/IndexError from single_prompt_batch's missing/mis-sized "latents";
+    the diversity metrics land in the returned dict as plain floats (not graph-carrying
+    tensors); and — the point of the term — the whole rollout -> VAE decode -> embed ->
+    diversity-loss chain is differentiable, so gradient reaches the student LoRA parameter."""
+    loss, metrics, net, rollout_calls = _run_diversity_process_batch(tiny_k2_model, seed=5)
 
     assert loss.ndim == 0 and torch.isfinite(loss)
-    assert "loss/diversity" in metrics
-    assert "tdm/diversity_score" in metrics
+    assert isinstance(metrics["loss/diversity"], float)
+    assert isinstance(metrics["tdm/diversity_score"], float)
+    assert metrics["tdm/diversity_score"] == -metrics["loss/diversity"]
 
     # Two rollouts happen: the main student rollout (step 1) and the group-diversity rollout.
     assert len(rollout_calls) == 2
-    main_call, diversity_call = rollout_calls
-    # Bug 2 fix: the diversity rollout must use the "no grad needed" convention
-    # (grad_from_step == num_steps), matching the main rollout, not grad_from_step=0.
-    assert diversity_call["grad_from_step"] == main_call["grad_from_step"]
-    assert all(not t.requires_grad for t in diversity_call["trajectory"])
+    _main_call, diversity_call = rollout_calls
+    # The diversity rollout must be fully grad-enabled (grad_from_step=0) so the diversity loss
+    # can backprop through every Euler step into the LoRA weights.
+    assert diversity_call["grad_from_step"] == 0
+    assert diversity_call["trajectory"][-1].requires_grad
 
     loss.backward()
     assert net.lora_w.grad is not None
+
+
+def test_process_batch_diversity_weight_changes_student_gradient(tiny_k2_model):
+    """Stronger guard that the diversity term is a live training signal and not dead weight:
+    at the same seed, the student LoRA's gradient must differ between diversity_weight=0 (block
+    skipped entirely) and a nonzero weight. A non-differentiable diversity path would leave the
+    two gradients identical."""
+    loss_off, _, net_off, _ = _run_diversity_process_batch(tiny_k2_model, seed=7, tdm_diversity_weight=0.0)
+    loss_off.backward()
+    grad_off = net_off.lora_w.grad.clone()
+
+    loss_on, _, net_on, _ = _run_diversity_process_batch(tiny_k2_model, seed=7, tdm_diversity_weight=1.0)
+    loss_on.backward()
+    grad_on = net_on.lora_w.grad.clone()
+
+    assert grad_off is not None and grad_on is not None
+    assert not torch.equal(grad_off, grad_on)
 
 
 def test_process_batch_vanilla_fallthrough(tiny_k2_model):
