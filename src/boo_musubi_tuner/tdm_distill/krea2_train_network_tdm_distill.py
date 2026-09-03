@@ -143,6 +143,25 @@ class Krea2TdmDistillNetworkTrainer(Krea2NetworkTrainer):
         )
         return metadata
 
+    def on_post_save(
+        self,
+        args: argparse.Namespace,
+        accelerator: Accelerator,
+        network,
+        transformer,
+        ckpt_name: str,
+        save_dtype,
+        metadata: dict,
+        force_sync_upload: bool,
+    ) -> None:
+        super().on_post_save(args, accelerator, network, transformer, ckpt_name, save_dtype, metadata, force_sync_upload)
+        if not args.tdm_distill:
+            return
+        # process_batch always leaves the student role active on return, so this is a no-op
+        # safety assertion in the common case, not an active swap. The fake-score critic is a
+        # training-only auxiliary network and must never end up in a saved checkpoint.
+        self._role_switcher.use_student()
+
     def _student_rollout(
         self,
         args,

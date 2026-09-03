@@ -34,3 +34,54 @@ composability gaps (see the class docstring):
 
 Check these before mixing XM into a new architecture. It also needs a musubi-tuner core patch — see
 [docs/explorative-modeling.md#requirements](../explorative-modeling.md#requirements).
+
+## tdm_distill: single-transformer three-role LoRA swap
+
+`LoraRoleSwitcher` (`tdm_distill.py`) extends `self_flow`'s EMA-teacher `state_dict` swap trick from
+two states (current/EMA) to three roles on one physical LoRA network: teacher (multiplier forced to
+0, zero weight-copy cost), student, and fake-score (both independently trainable, swapped via
+`load_state_dict` immediately before each forward). This avoids needing a second resident full
+transformer for the teacher — K2 raw's native behavior with the LoRA's multiplier at 0 already *is*
+the teacher, since the base weights are always K2 raw's.
+
+`process_batch` is data-free: it discards the dataloader's cached `latents`/`noise` entirely and
+only uses `batch["krea2_vl_embed"]` (the caption). This is the one place in this repo where a
+`process_batch` override doesn't just add a loss term on top of the real training signal — it
+replaces the training signal outright when `--tdm_distill` is on.
+
+The fake-score critic is trained by a second, extension-owned optimizer (`self._fake_score_optimizer`,
+built via a second call to `self.get_optimizer(...)` inside `on_train_start`, `accelerate.prepare`d
+separately), backward/stepped manually inside `process_batch` — the only extension in this repo with
+more than one live optimizer. `process_batch` must always leave the LoRA network on its **student**
+role when it returns, since the base trainer's outer loop calls `accelerator.backward`/
+`optimizer.step()` on whatever `network`'s current live weights are. `on_post_save` reasserts this
+(`switcher.use_student()`) as a cheap safety net before the base trainer's own save runs, so the
+fake-score critic — a training-only auxiliary network, never meant to ship — can never leak into a
+saved checkpoint even if a future change to `process_batch` breaks the invariant above.
+
+**The DINOv3 diversity term is a real, fully differentiable training signal**, not a passive metric
+computed for logging. `Dinov3ImageEmbedder.embed_differentiable` (`tdm_distill.py`) deliberately
+avoids the class's other method, `embed()` — that one is `@torch.no_grad()` and takes PIL/numpy
+input via `self.processor`, both of which sever the autograd graph. `embed_differentiable` instead
+takes an already-decoded `(N, C, H, W)` tensor and does resize/normalize with plain differentiable
+tensor ops, keeping the graph intact from the DINOv3 CLS-token embedding all the way back through
+the VAE decode and the student rollout to the LoRA weights. This required two things elsewhere in
+`process_batch`: (1) the group-diversity rollout is called with `grad_from_step=0` (every step
+grad-enabled), unlike the main TDM rollout, which only needs its final step's graph and runs the
+rest under `no_grad` for efficiency; and (2) the VAE decode for this rollout runs without
+`torch.no_grad()`, with the VAE's own parameters frozen (`requires_grad_(False)`, lazily on first
+use) rather than the decode itself being no-grad, so gradient reaches the input latents while the
+VAE's weights accumulate no `.grad`.
+
+That grad-enabled VAE decode has a consequence for VAE placement: the base trainer normally keeps
+the VAE on CPU between uses and moves it to the training device and back within a single call (see
+`load_vae`/`on_before_sample_images`). That round-trip pattern is unsafe here — `nn.Module.to()`
+rebinds parameter storage in place, and the diversity decode's output feeds a live autograd graph
+that `accelerator.backward()` (called by the outer training loop, *after* `process_batch` returns)
+still needs to walk. Moving the VAE back to CPU inside `process_batch` would corrupt that graph with
+a device mismatch mid-backward. Instead `process_batch` moves the VAE to the training device and
+leaves it there, recording the fact via `self._vae_ref`/`self._vae_needs_cpu_return`; a new
+`on_post_optimizer_step` override moves it back to CPU, timed to run strictly after that step's
+`accelerator.backward()` and optimizer step have both completed and the graph is dead. This is the
+only extension in this repo where a hook other than `process_batch` itself has to manage VAE
+device placement.
