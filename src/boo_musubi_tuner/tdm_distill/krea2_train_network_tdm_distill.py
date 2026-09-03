@@ -19,7 +19,15 @@ from musubi_tuner.hv_train_network import read_config_from_file, setup_parser_co
 from musubi_tuner.krea2 import krea2_sampling
 from musubi_tuner.krea2_train_network import Krea2NetworkTrainer, krea2_setup_parser
 
-from boo_musubi_tuner.tdm_distill.tdm_distill import LoraRoleSwitcher
+from boo_musubi_tuner.tdm_distill.tdm_distill import (
+    LoraRoleSwitcher,
+    fake_score_denoising_loss,
+    pseudo_huber_c,
+    pseudo_huber_loss,
+    revised_sample,
+    sample_step_count,
+    sample_trajectory_interval,
+)
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -145,6 +153,123 @@ class Krea2TdmDistillNetworkTrainer(Krea2NetworkTrainer):
                 img = img + (tprev - tcurr) * output.pred
             trajectory.append(img)
         return trajectory, list(ts)
+
+    def process_batch(
+        self,
+        args: argparse.Namespace,
+        accelerator: Accelerator,
+        transformer,
+        network,
+        batch: dict,
+        latents: torch.Tensor,
+        noise: torch.Tensor,
+        noise_scheduler,
+        dit_dtype,
+        network_dtype,
+        vae,
+        global_step: int,
+    ) -> "tuple[torch.Tensor, dict[str, float]]":
+        """TDM step replacing vanilla flow matching. Data-free: `latents`/`noise` args are
+        ignored — only batch["krea2_vl_embed"] (the prompt) is used, per the design doc's
+        data-free TDM decision. Returns L_tdm only; Task 8 adds the diversity term on top."""
+        if not args.tdm_distill:
+            return super().process_batch(
+                args,
+                accelerator,
+                transformer,
+                network,
+                batch,
+                latents,
+                noise,
+                noise_scheduler,
+                dit_dtype,
+                network_dtype,
+                vae,
+                global_step,
+            )
+
+        device = accelerator.device
+        switcher = self._role_switcher
+
+        # Draw from the global RNG (generator=None): a freshly constructed torch.Generator has a
+        # fixed default seed, so building one per call would pick the *same* K and interval on
+        # every training step. The global RNG still honours the run's torch.manual_seed.
+        num_steps = sample_step_count(args.tdm_step_counts, generator=None)
+        interval = sample_trajectory_interval(num_steps, generator=None)
+
+        # 1. build the trajectory up to (and including) x_ti under the student role. The whole
+        #    rollout runs under no_grad (grad_from_step=num_steps): the grad-carrying copy of the
+        #    final incremental step is recomputed in step 5, *after* all role swaps are done.
+        #    Building it here instead would leave a live graph over the LoRA weights across the
+        #    fake-score/teacher swaps, and LoraRoleSwitcher's load_state_dict bumps those params'
+        #    version counters — the outer loop's deferred backward() would then raise
+        #    "variable needed for gradient computation has been modified by an inplace operation".
+        switcher.use_student()
+        trajectory, ts = self._student_rollout(
+            args,
+            accelerator,
+            transformer,
+            batch,
+            num_steps,
+            grad_from_step=num_steps,
+            device=device,
+            dit_dtype=dit_dtype,
+            network_dtype=network_dtype,
+        )
+        x_i, x_ti = trajectory[interval], trajectory[interval + 1]
+        t_i, t_i_plus_1 = ts[interval], ts[interval + 1]
+
+        # 2. diffuse x_ti with fresh noise to get x_tau, roughly halfway into the interval.
+        tau = (t_i + t_i_plus_1) / 2.0
+        fresh_noise = torch.randn_like(x_ti.detach())
+        x_tau = (1 - tau) * x_ti.detach() + tau * fresh_noise
+        timesteps_tau = torch.full((x_ti.shape[0],), tau * 1000.0, device=device, dtype=torch.float32)
+
+        # 3. fake-score update: predict at x_tau, denoise toward x_ti, step its own optimizer.
+        switcher.use_fake_score()
+        fake_score_pred = self.call_dit(
+            args, accelerator, transformer, x_tau, batch, fresh_noise, x_tau, timesteps_tau, network_dtype
+        ).pred
+        fake_score_loss = fake_score_denoising_loss(fake_score_pred, x_ti.detach())
+        accelerator.backward(fake_score_loss)
+        self._fake_score_optimizer.step()
+        self._fake_score_optimizer.zero_grad(set_to_none=True)
+
+        # 4. real score (teacher, frozen) and fake score (just-updated) at x_tau -> revised target.
+        switcher.use_teacher()
+        with torch.no_grad():
+            real_score = self.call_dit(
+                args, accelerator, transformer, x_tau, batch, fresh_noise, x_tau, timesteps_tau, network_dtype
+            ).pred
+        switcher.use_fake_score()
+        with torch.no_grad():
+            fake_score_updated = self.call_dit(
+                args, accelerator, transformer, x_tau, batch, fresh_noise, x_tau, timesteps_tau, network_dtype
+            ).pred
+        lambda_tau = t_i_plus_1 - t_i
+        x_revised = revised_sample(x_ti.detach(), real_score, fake_score_updated, lambda_tau).detach()
+
+        # 5. student loss: re-run the single Euler step landing on x_ti, now with grad and with the
+        #    student role live, so the graph handed back to the outer loop's backward() is the last
+        #    thing built and no weight swap follows it. Numerically identical to step 1's x_ti (same
+        #    weights, same inputs) — only the graph differs.
+        switcher.use_student()
+        timesteps_i = torch.full((x_i.shape[0],), t_i * 1000.0, device=device, dtype=torch.float32)
+        student_pred = self.call_dit(
+            args, accelerator, transformer, x_i, batch, trajectory[0], x_i, timesteps_i, network_dtype
+        ).pred
+        x_ti_student = x_i + (t_i_plus_1 - t_i) * student_pred
+
+        data_dim = x_ti.shape[1:].numel()
+        loss = pseudo_huber_loss(x_ti_student, x_revised, c=pseudo_huber_c(data_dim))
+
+        metrics = {
+            "loss/tdm": loss.detach().item(),
+            "loss/fake_score": fake_score_loss.detach().item(),
+            "tdm/k": float(num_steps),
+            "tdm/interval": float(interval),
+        }
+        return loss, metrics
 
 
 def tdm_distill_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
