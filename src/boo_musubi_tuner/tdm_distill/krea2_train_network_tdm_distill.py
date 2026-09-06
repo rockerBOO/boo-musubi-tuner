@@ -23,6 +23,7 @@ from boo_musubi_tuner.tdm_distill.tdm_distill import (
     cfg_combine,
     diversity_loss_from_embeddings,
     fake_score_denoising_loss,
+    min_snr_weight,
     pseudo_huber_c,
     pseudo_huber_loss,
     revised_sample,
@@ -350,7 +351,7 @@ class Krea2TdmDistillNetworkTrainer(Krea2NetworkTrainer):
             args, accelerator, transformer, x_tau, batch, fresh_noise, x_tau, timesteps_tau, network_dtype
         ).pred
         fake_score_target = (fresh_noise - x_ti.detach()).detach()
-        fake_score_loss = fake_score_denoising_loss(fake_score_pred, fake_score_target)
+        fake_score_loss = fake_score_denoising_loss(fake_score_pred, fake_score_target, omega_tau=min_snr_weight(tau))
         accelerator.backward(fake_score_loss)
         self._fake_score_optimizer.step()
         self._fake_score_optimizer.zero_grad(set_to_none=True)

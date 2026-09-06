@@ -55,6 +55,15 @@ def fake_score_denoising_loss(
     return (omega_tau * (fake_score_pred - target) ** 2).mean()
 
 
+def min_snr_weight(tau: "float | torch.Tensor", gamma: float = 5.0) -> "float | torch.Tensor":
+    """Min-SNR-clamped timestep importance weight (omega_tau, TDM Eq. 7), re-derived for this
+    module's velocity-space critic target (v = eps - x0, under x_tau = (1-tau)*x0 + tau*eps).
+    Provably equivalent to running gamma-clamped min-SNR (Hang et al. 2023) on an x0-space loss:
+    ||x0_pred - x0||^2 = tau**2 * ||v_pred - v||^2 for this parameterization, so weighting the
+    v-loss by min(SNR(tau), gamma) * tau**2 reproduces the identical per-sample loss value."""
+    return min((1 - tau) ** 2, gamma * tau**2)
+
+
 def sample_step_count(step_counts: list[int], generator: "torch.Generator | None" = None) -> int:
     """Uniformly draw one student sampling-step count K from the configured list (TDM Eq. 8's
     sampling-steps-aware objective — makes the student usable across multiple step budgets)."""

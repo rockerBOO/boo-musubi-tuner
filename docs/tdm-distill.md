@@ -74,8 +74,13 @@ the student learns — it is not a passive/logging-only metric computed on the s
   loads the Qwen3-VL encoder once to build a cached unconditional (empty-prompt) embedding, then
   frees it — same pattern as `--sample_prompts` encoding. `--tdm_guidance_scale <= 1.0` disables
   CFG and skips this entirely (single conditional teacher forward, no `--text_encoder` needed).
-- **Simplified TDM math**: `fake_score_denoising_loss` implements a plain weighted MSE, not the
-  paper's full importance-sampling-reweighted Eq. 7. Treat this as an approximation.
+- **omega_tau is min-SNR only, no importance-sampling term**: the fake-score critic's denoising
+  loss (Eq. 7) is weighted by `min_snr_weight` (gamma=5, fixed), re-derived for this module's
+  velocity-space critic target from the standard min-SNR weighting strategy (Hang et al. 2023).
+  The official TDM implementation also applies an importance-sampling correction on top of this,
+  but that term corrects for a bias specific to *their* two-hop, model-dependent noise
+  construction; this module's `x_tau` is sampled in a single hop with a fresh random Gaussian
+  draw, which is already unbiased, so no such correction applies here.
 - **Not annealed**: `--tdm_diversity_weight` should be left constant throughout training — Krea's
   own report found annealing this weight toward zero caused diversity to collapse quickly.
 - **VAE stays resident on the training device for the whole step when the diversity term runs**:

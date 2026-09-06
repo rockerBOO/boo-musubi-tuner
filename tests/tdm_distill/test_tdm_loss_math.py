@@ -8,6 +8,7 @@ import torch
 from boo_musubi_tuner.tdm_distill.tdm_distill import (
     cfg_combine,
     fake_score_denoising_loss,
+    min_snr_weight,
     pseudo_huber_c,
     pseudo_huber_loss,
     revised_sample,
@@ -85,3 +86,40 @@ def test_cfg_combine_scale_one_recovers_cond():
     uncond = torch.tensor([[1.0, 1.0]])
     result = cfg_combine(cond, uncond, guidance_scale=1.0)
     assert torch.allclose(result, cond)
+
+
+def test_min_snr_weight_at_low_tau_clamps_to_gamma_term():
+    tau = 0.05
+    gamma = 5.0
+    result = min_snr_weight(tau, gamma=gamma)
+    assert result == pytest.approx(gamma * tau**2)
+
+
+def test_min_snr_weight_at_high_tau_uses_snr_term():
+    tau = 0.95
+    gamma = 5.0
+    result = min_snr_weight(tau, gamma=gamma)
+    assert result == pytest.approx((1 - tau) ** 2)
+
+
+def test_min_snr_weight_matches_closed_form_at_midpoint():
+    tau = 0.5
+    gamma = 5.0
+    result = min_snr_weight(tau, gamma=gamma)
+    expected = min((1 - tau) ** 2, gamma * tau**2)
+    assert result == pytest.approx(expected)
+
+
+def test_min_snr_weight_default_gamma_is_five():
+    tau = 0.5
+    assert min_snr_weight(tau) == pytest.approx(min((1 - tau) ** 2, 5.0 * tau**2))
+
+
+def test_fake_score_denoising_loss_accepts_min_snr_weight():
+    pred = torch.tensor([[2.0, 4.0]])
+    target = torch.tensor([[1.0, 1.0]])
+    tau = 0.5
+    weight = min_snr_weight(tau)
+    result = fake_score_denoising_loss(pred, target, omega_tau=weight)
+    expected = (weight * (pred - target) ** 2).mean()
+    assert torch.allclose(result, expected)

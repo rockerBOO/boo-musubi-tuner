@@ -325,3 +325,28 @@ def test_process_batch_cfg_on_two_teacher_forwards_and_combines(tiny_k2_model, m
     expected_real_score = cfg_combine(cond_score, uncond_score, args.tdm_guidance_scale)
     assert torch.allclose(revised_sample_calls[0], expected_real_score)
     assert not torch.allclose(revised_sample_calls[0], cond_score)
+
+
+def test_process_batch_fake_score_loss_uses_min_snr_weight(tiny_k2_model, monkeypatch):
+    """process_batch's fake-score loss call must pass a tau-dependent omega_tau, not the default 1.0."""
+    torch.manual_seed(6)
+    trainer, args, acc, net, _handle = _prepared_trainer(tiny_k2_model, tdm_guidance_scale=1.0)
+    for p in tiny_k2_model.parameters():
+        p.requires_grad_(True)
+    batch, latents, noise = make_k2_batch(B=1, H=8, W=8, n_txt=3)
+    scheduler = make_noise_scheduler(args)
+
+    calls = []
+    orig_loss_fn = tdm_module.fake_score_denoising_loss
+
+    def spy_loss_fn(fake_score_pred, target, omega_tau=1.0):
+        calls.append(omega_tau)
+        return orig_loss_fn(fake_score_pred, target, omega_tau=omega_tau)
+
+    monkeypatch.setattr(tdm_module, "fake_score_denoising_loss", spy_loss_fn)
+    trainer.process_batch(
+        args, acc, tiny_k2_model, net, batch, latents, noise, scheduler, torch.float32, torch.float32, None, global_step=0
+    )
+    assert len(calls) == 1
+    assert calls[0] != 1.0
+    assert 0.0 <= calls[0] <= 5.0
