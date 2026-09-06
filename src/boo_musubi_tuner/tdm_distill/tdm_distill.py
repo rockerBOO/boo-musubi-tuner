@@ -58,12 +58,10 @@ def sample_step_count(step_counts: list[int], generator: "torch.Generator | None
 
 
 def sample_trajectory_interval(num_steps: int, generator: "torch.Generator | None" = None) -> int:
-    """Uniformly pick one interval index along a num_steps-point trajectory (TDM's non-overlapping
-    interval sampling — a single fake-score forward suffices per training iteration). A
-    single-step trajectory (num_steps == 1) has exactly one interval, at index 0."""
-    if num_steps == 1:
-        return 0
-    return int(torch.randint(0, num_steps - 1, (1,), generator=generator).item())
+    """Uniformly pick one interval index along a num_steps-step trajectory (TDM's non-overlapping
+    interval sampling — a single fake-score forward suffices per training iteration). A K-step
+    trajectory has K intervals, indices 0..K-1; index K-1 is the interval landing on t = 0."""
+    return int(torch.randint(0, num_steps, (1,), generator=generator).item())
 
 
 def pairwise_cosine_diversity(embeddings: torch.Tensor) -> float:

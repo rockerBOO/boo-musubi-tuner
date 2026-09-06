@@ -27,16 +27,24 @@ def test_sample_trajectory_interval_in_range():
     gen = torch.Generator().manual_seed(1)
     for _ in range(50):
         i = sample_trajectory_interval(num_steps=8, generator=gen)
-        assert 0 <= i < 7
+        assert 0 <= i < 8
 
 
-def test_sample_trajectory_interval_two_steps_only_zero():
+def test_sample_trajectory_interval_two_steps_both_reachable():
     gen = torch.Generator().manual_seed(2)
-    assert sample_trajectory_interval(num_steps=2, generator=gen) == 0
+    seen = {sample_trajectory_interval(num_steps=2, generator=gen) for _ in range(50)}
+    assert seen == {0, 1}
 
 
 def test_sample_trajectory_interval_single_step_returns_zero():
     assert sample_trajectory_interval(num_steps=1) == 0
+
+
+def test_sample_trajectory_interval_final_interval_reachable_for_all_step_counts():
+    for num_steps in (1, 2, 4, 8):
+        gen = torch.Generator().manual_seed(num_steps)
+        seen = {sample_trajectory_interval(num_steps=num_steps, generator=gen) for _ in range(100)}
+        assert num_steps - 1 in seen
 
 
 def test_pairwise_cosine_diversity_identical_embeddings_is_zero():

@@ -73,9 +73,6 @@ the student learns — it is not a passive/logging-only metric computed on the s
   intent of the teacher representing K2 raw's true CFG-guided behavior.
 - **Simplified TDM math**: `fake_score_denoising_loss` implements a plain weighted MSE, not the
   paper's full importance-sampling-reweighted Eq. 7. Treat this as an approximation.
-- **Final trajectory interval is never trained**: `sample_trajectory_interval` is off by one against
-  how `_student_rollout` numbers intervals, so for K >= 2 the last interval — the step landing on
-  t = 0 — is never sampled. K = 1 is unaffected. See `notes/tdm-distill-paper-gaps.md`.
 - **Not annealed**: `--tdm_diversity_weight` should be left constant throughout training — Krea's
   own report found annealing this weight toward zero caused diversity to collapse quickly.
 - **VAE stays resident on the training device for the whole step when the diversity term runs**:
