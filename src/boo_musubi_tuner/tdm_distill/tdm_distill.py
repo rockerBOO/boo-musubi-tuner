@@ -38,6 +38,11 @@ def revised_sample(
     return x_ti + lambda_tau * (real_score - fake_score)
 
 
+def cfg_combine(cond_score: torch.Tensor, uncond_score: torch.Tensor, guidance_scale: float) -> torch.Tensor:
+    """Classifier-free guidance combination: uncond + scale * (cond - uncond)."""
+    return uncond_score + guidance_scale * (cond_score - uncond_score)
+
+
 def fake_score_denoising_loss(
     fake_score_pred: torch.Tensor,
     target: torch.Tensor,

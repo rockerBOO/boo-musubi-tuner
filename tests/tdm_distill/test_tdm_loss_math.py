@@ -6,6 +6,7 @@ import pytest
 import torch
 
 from boo_musubi_tuner.tdm_distill.tdm_distill import (
+    cfg_combine,
     fake_score_denoising_loss,
     pseudo_huber_c,
     pseudo_huber_loss,
@@ -69,3 +70,18 @@ def test_fake_score_denoising_loss_weighted():
     unweighted = fake_score_denoising_loss(pred, target, omega_tau=1.0)
     weighted = fake_score_denoising_loss(pred, target, omega_tau=2.0)
     assert weighted.item() == pytest.approx(2.0 * unweighted.item())
+
+
+def test_cfg_combine_matches_formula():
+    cond = torch.tensor([[2.0, 4.0]])
+    uncond = torch.tensor([[1.0, 1.0]])
+    result = cfg_combine(cond, uncond, guidance_scale=3.0)
+    expected = uncond + 3.0 * (cond - uncond)
+    assert torch.allclose(result, expected)
+
+
+def test_cfg_combine_scale_one_recovers_cond():
+    cond = torch.tensor([[2.0, 4.0]])
+    uncond = torch.tensor([[1.0, 1.0]])
+    result = cfg_combine(cond, uncond, guidance_scale=1.0)
+    assert torch.allclose(result, cond)
