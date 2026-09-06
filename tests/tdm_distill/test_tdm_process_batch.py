@@ -4,6 +4,7 @@ from musubi_tuner.modules.scheduling_flow_match_discrete import FlowMatchDiscret
 
 import boo_musubi_tuner.tdm_distill.krea2_train_network_tdm_distill as tdm_module
 from boo_musubi_tuner.tdm_distill.krea2_train_network_tdm_distill import Krea2TdmDistillNetworkTrainer
+from boo_musubi_tuner.tdm_distill.tdm_distill import cfg_combine
 from tests.self_flow.conftest_k2_self_flow import make_k2_batch
 from tests.tdm_distill.conftest import FakeAccelerator, StubLoraNetwork
 
@@ -299,6 +300,16 @@ def test_process_batch_cfg_on_two_teacher_forwards_and_combines(tiny_k2_model, m
         return output
 
     trainer.call_dit = spy_call_dit
+
+    revised_sample_calls = []
+    orig_revised_sample = tdm_module.revised_sample
+
+    def spy_revised_sample(x_ti, real_score, fake_score_updated, lambda_tau):
+        revised_sample_calls.append(real_score.detach().clone())
+        return orig_revised_sample(x_ti, real_score, fake_score_updated, lambda_tau)
+
+    monkeypatch.setattr(tdm_module, "revised_sample", spy_revised_sample)
+
     trainer.process_batch(
         args, acc, tiny_k2_model, net, batch, latents, noise, scheduler, torch.float32, torch.float32, None, global_step=0
     )
@@ -306,3 +317,11 @@ def test_process_batch_cfg_on_two_teacher_forwards_and_combines(tiny_k2_model, m
     assert len(teacher_preds) == 2
     cond_score, uncond_score = teacher_preds
     assert not torch.allclose(cond_score, uncond_score)
+
+    # The real_score actually consumed downstream (by revised_sample) must be the cfg_combine
+    # output, not a discarded/bypassed cond_score. This catches an implementation that silently
+    # drops the cfg_combine call and leaves real_score == cond_score.
+    assert len(revised_sample_calls) == 1
+    expected_real_score = cfg_combine(cond_score, uncond_score, args.tdm_guidance_scale)
+    assert torch.allclose(revised_sample_calls[0], expected_real_score)
+    assert not torch.allclose(revised_sample_calls[0], cond_score)
