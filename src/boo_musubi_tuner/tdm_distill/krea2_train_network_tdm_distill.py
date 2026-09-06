@@ -20,6 +20,7 @@ from musubi_tuner.krea2_train_network import Krea2NetworkTrainer, krea2_setup_pa
 
 from boo_musubi_tuner.tdm_distill.tdm_distill import (
     LoraRoleSwitcher,
+    cfg_combine,
     diversity_loss_from_embeddings,
     fake_score_denoising_loss,
     pseudo_huber_c,
@@ -357,9 +358,19 @@ class Krea2TdmDistillNetworkTrainer(Krea2NetworkTrainer):
         # 4. real score (teacher, frozen) and fake score (just-updated) at x_tau -> revised target.
         switcher.use_teacher()
         with torch.no_grad():
-            real_score = self.call_dit(
+            cond_score = self.call_dit(
                 args, accelerator, transformer, x_tau, batch, fresh_noise, x_tau, timesteps_tau, network_dtype
             ).pred
+            if args.tdm_guidance_scale > 1.0:
+                bsize = x_tau.shape[0]
+                uncond_batch = dict(batch)
+                uncond_batch["krea2_vl_embed"] = [self._teacher_uncond_embed] * bsize
+                uncond_score = self.call_dit(
+                    args, accelerator, transformer, x_tau, uncond_batch, fresh_noise, x_tau, timesteps_tau, network_dtype
+                ).pred
+                real_score = cfg_combine(cond_score, uncond_score, args.tdm_guidance_scale)
+            else:
+                real_score = cond_score
         switcher.use_fake_score()
         with torch.no_grad():
             fake_score_updated = self.call_dit(

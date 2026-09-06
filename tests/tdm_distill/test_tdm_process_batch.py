@@ -2,6 +2,7 @@ import torch
 from musubi_tuner.krea2.krea2_mmdit import SingleStreamDiT
 from musubi_tuner.modules.scheduling_flow_match_discrete import FlowMatchDiscreteScheduler
 
+import boo_musubi_tuner.tdm_distill.krea2_train_network_tdm_distill as tdm_module
 from boo_musubi_tuner.tdm_distill.krea2_train_network_tdm_distill import Krea2TdmDistillNetworkTrainer
 from tests.self_flow.conftest_k2_self_flow import make_k2_batch
 from tests.tdm_distill.conftest import FakeAccelerator, StubLoraNetwork
@@ -242,3 +243,66 @@ def test_process_batch_vanilla_fallthrough(tiny_k2_model):
     )
     assert loss.ndim == 0 and torch.isfinite(loss)
     assert metrics == {}
+
+
+def test_process_batch_cfg_off_single_teacher_forward(tiny_k2_model):
+    """tdm_guidance_scale <= 1.0 must cost exactly one teacher forward -- no perf regression."""
+    torch.manual_seed(6)
+    trainer, args, acc, net, _handle = _prepared_trainer(tiny_k2_model, tdm_guidance_scale=1.0)
+    for p in tiny_k2_model.parameters():
+        p.requires_grad_(True)
+    batch, latents, noise = make_k2_batch(B=1, H=8, W=8, n_txt=3)
+    scheduler = make_noise_scheduler(args)
+
+    teacher_calls = []
+    orig_call_dit = trainer.call_dit
+
+    def spy_call_dit(*a, **kw):
+        if net.multiplier == 0.0:
+            teacher_calls.append(1)
+        return orig_call_dit(*a, **kw)
+
+    trainer.call_dit = spy_call_dit
+    trainer.process_batch(
+        args, acc, tiny_k2_model, net, batch, latents, noise, scheduler, torch.float32, torch.float32, None, global_step=0
+    )
+    assert len(teacher_calls) == 1
+
+
+def test_process_batch_cfg_on_two_teacher_forwards_and_combines(tiny_k2_model, monkeypatch):
+    """tdm_guidance_scale > 1.0 must run cond + uncond teacher forwards and combine via cfg_combine."""
+    torch.manual_seed(6)
+    # _prepared_trainer's on_train_start runs the real (Task 3) CFG caching path when
+    # tdm_guidance_scale > 1.0 and text_encoder is set -- stub the encoder load so it doesn't try
+    # to read a real file. Shape matches tiny_k2_config's txtlayers=1, txtdim=32.
+    monkeypatch.setattr(tdm_module.krea2_utils, "load_krea2_text_encoder", lambda path, dtype, device: object())
+    monkeypatch.setattr(
+        tdm_module.krea2_utils,
+        "get_krea2_prompt_embeds",
+        lambda encoder, prompts: (torch.randn(1, 2, 1, 32), torch.ones(1, 2, dtype=torch.bool)),
+    )
+    trainer, args, acc, net, _handle = _prepared_trainer(
+        tiny_k2_model, tdm_guidance_scale=3.5, text_encoder="/path/to/qwen3_vl.safetensors"
+    )
+    for p in tiny_k2_model.parameters():
+        p.requires_grad_(True)
+    batch, latents, noise = make_k2_batch(B=1, H=8, W=8, n_txt=3)
+    scheduler = make_noise_scheduler(args)
+
+    teacher_preds = []
+    orig_call_dit = trainer.call_dit
+
+    def spy_call_dit(*a, **kw):
+        output = orig_call_dit(*a, **kw)
+        if net.multiplier == 0.0:
+            teacher_preds.append(output.pred.detach().clone())
+        return output
+
+    trainer.call_dit = spy_call_dit
+    trainer.process_batch(
+        args, acc, tiny_k2_model, net, batch, latents, noise, scheduler, torch.float32, torch.float32, None, global_step=0
+    )
+    # Two teacher forwards this step: cond then uncond.
+    assert len(teacher_preds) == 2
+    cond_score, uncond_score = teacher_preds
+    assert not torch.allclose(cond_score, uncond_score)
