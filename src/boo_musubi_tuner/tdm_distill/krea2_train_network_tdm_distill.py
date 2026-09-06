@@ -61,6 +61,13 @@ class Krea2TdmDistillNetworkTrainer(Krea2NetworkTrainer):
                 f"--tdm_diversity_group_size ({args.tdm_diversity_group_size}) must be >= 2 "
                 "(pairwise diversity is undefined for fewer than 2 samples)."
             )
+        if args.tdm_guidance_scale is None:
+            raise ValueError("--tdm_guidance_scale is required when --tdm_distill is set.")
+        if args.tdm_guidance_scale > 1.0 and not args.text_encoder:
+            raise ValueError(
+                "--text_encoder is required when --tdm_guidance_scale > 1.0. CFG needs the Qwen3-VL "
+                "encoder to build the unconditional (empty-prompt) embedding once at train start."
+            )
         if args.gradient_accumulation_steps != 1:
             raise ValueError(
                 f"--gradient_accumulation_steps ({args.gradient_accumulation_steps}) must be 1 when --tdm_distill is set. "
@@ -480,6 +487,14 @@ def tdm_distill_setup_parser(parser: argparse.ArgumentParser) -> argparse.Argume
         type=float,
         default=0.1,
         help="Constant weight on the DINOv3 group-diversity loss term (not annealed).",
+    )
+    parser.add_argument(
+        "--tdm_guidance_scale",
+        type=float,
+        default=None,
+        help="CFG scale for the teacher's real-score forward: uncond + scale * (cond - uncond). "
+        "<= 1.0 disables CFG (single conditional teacher forward, no extra cost). No default -- "
+        "every --tdm_distill run must set this explicitly.",
     )
     parser.add_argument(
         "--fake_score_learning_rate",

@@ -20,6 +20,7 @@ def make_args(**overrides):
     # Required by default since the default diversity weight is > 0 (the VAE is only loaded when
     # sampling is configured).
     args.sample_prompts = "prompts.txt"
+    args.tdm_guidance_scale = 1.0
     for k, v in overrides.items():
         setattr(args, k, v)
     return args
@@ -90,4 +91,36 @@ def test_gradient_accumulation_above_one_raises():
 def test_gradient_accumulation_above_one_ok_when_tdm_distill_off():
     trainer = Krea2TdmDistillNetworkTrainer()
     args = make_args(tdm_distill=False, gradient_accumulation_steps=2)
+    trainer.handle_model_specific_args(args)
+
+
+def test_missing_guidance_scale_raises():
+    trainer = Krea2TdmDistillNetworkTrainer()
+    args = make_args(tdm_guidance_scale=None)
+    with pytest.raises(ValueError, match="tdm_guidance_scale"):
+        trainer.handle_model_specific_args(args)
+
+
+def test_missing_guidance_scale_ok_when_tdm_distill_off():
+    trainer = Krea2TdmDistillNetworkTrainer()
+    args = make_args(tdm_distill=False, tdm_guidance_scale=None)
+    trainer.handle_model_specific_args(args)
+
+
+def test_guidance_scale_above_one_requires_text_encoder():
+    trainer = Krea2TdmDistillNetworkTrainer()
+    args = make_args(tdm_guidance_scale=3.5, text_encoder=None)
+    with pytest.raises(ValueError, match="text_encoder"):
+        trainer.handle_model_specific_args(args)
+
+
+def test_guidance_scale_at_or_below_one_ok_without_text_encoder():
+    trainer = Krea2TdmDistillNetworkTrainer()
+    args = make_args(tdm_guidance_scale=1.0, text_encoder=None)
+    trainer.handle_model_specific_args(args)
+
+
+def test_guidance_scale_above_one_ok_with_text_encoder():
+    trainer = Krea2TdmDistillNetworkTrainer()
+    args = make_args(tdm_guidance_scale=3.5, text_encoder="/path/to/qwen3_vl.safetensors")
     trainer.handle_model_specific_args(args)
