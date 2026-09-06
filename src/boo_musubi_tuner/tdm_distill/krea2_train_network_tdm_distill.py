@@ -8,13 +8,14 @@ Internal extension point — no API stability guarantees. Experimental.
 """
 
 import argparse
+import gc
 import itertools
 import logging
 
 import torch
 from accelerate import Accelerator
-from musubi_tuner.hv_train_network import read_config_from_file, setup_parser_common
-from musubi_tuner.krea2 import krea2_sampling
+from musubi_tuner.hv_train_network import clean_memory_on_device, read_config_from_file, setup_parser_common
+from musubi_tuner.krea2 import krea2_sampling, krea2_utils
 from musubi_tuner.krea2_train_network import Krea2NetworkTrainer, krea2_setup_parser
 
 from boo_musubi_tuner.tdm_distill.tdm_distill import (
@@ -43,6 +44,7 @@ class Krea2TdmDistillNetworkTrainer(Krea2NetworkTrainer):
         self._vae_ref = None
         self._vae_needs_cpu_return = False
         self._vae_frozen = False
+        self._teacher_uncond_embed: torch.Tensor | None = None
 
     def handle_model_specific_args(self, args: argparse.Namespace) -> None:
         super().handle_model_specific_args(args)
@@ -118,6 +120,14 @@ class Krea2TdmDistillNetworkTrainer(Krea2NetworkTrainer):
         self._fake_score_optimizer = accelerator.prepare(self._fake_score_optimizer)
 
         self._dinov3_embedder = None
+
+        if args.tdm_guidance_scale > 1.0:
+            encoder = krea2_utils.load_krea2_text_encoder(args.text_encoder, dtype=torch.bfloat16, device=accelerator.device)
+            hiddens, mask = krea2_utils.get_krea2_prompt_embeds(encoder, [""])
+            self._teacher_uncond_embed = hiddens[0][mask[0]].to("cpu")
+            del encoder
+            gc.collect()
+            clean_memory_on_device(accelerator.device)
 
         logger.info(
             f"TDM distillation enabled: step_counts={args.tdm_step_counts}, "

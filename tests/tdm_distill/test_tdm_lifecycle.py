@@ -1,6 +1,7 @@
 import pytest
 import torch
 
+import boo_musubi_tuner.tdm_distill.krea2_train_network_tdm_distill as tdm_module
 from boo_musubi_tuner.tdm_distill.krea2_train_network_tdm_distill import Krea2TdmDistillNetworkTrainer
 from boo_musubi_tuner.tdm_distill.tdm_distill import LoraRoleSwitcher
 from tests.tdm_distill.conftest import FakeAccelerator, StubLoraNetwork
@@ -75,3 +76,57 @@ def test_extra_metadata_empty_without_tdm_distill():
     trainer = Krea2TdmDistillNetworkTrainer()
     args = make_args(tdm_distill=False)
     assert trainer.extra_metadata(args) == {}
+
+
+class _FakeEncoder:
+    pass
+
+
+def test_on_train_start_caches_uncond_embed_when_cfg_enabled(monkeypatch):
+    calls = {}
+
+    def fake_load(path, dtype, device):
+        calls["load_args"] = (path, dtype, device)
+        return _FakeEncoder()
+
+    def fake_get_embeds(encoder, prompts):
+        calls["prompts"] = prompts
+        # (B=1, seq=3, L=1, D=2), mask marks first 2 tokens valid
+        hiddens = torch.tensor([[[[1.0, 2.0]], [[3.0, 4.0]], [[5.0, 6.0]]]])
+        mask = torch.tensor([[True, True, False]])
+        return hiddens, mask
+
+    monkeypatch.setattr(tdm_module.krea2_utils, "load_krea2_text_encoder", fake_load)
+    monkeypatch.setattr(tdm_module.krea2_utils, "get_krea2_prompt_embeds", fake_get_embeds)
+
+    trainer = Krea2TdmDistillNetworkTrainer()
+    args = make_args(tdm_guidance_scale=3.5, text_encoder="/path/to/qwen3_vl.safetensors", optimizer_type="AdamW")
+    net = StubLoraNetwork()
+    net.load_weights = lambda path: "ok"
+    acc = FakeAccelerator()
+
+    trainer.handle_model_specific_args(args)
+    trainer.on_train_start(args, acc, net, None, None)
+
+    assert calls["load_args"] == ("/path/to/qwen3_vl.safetensors", torch.bfloat16, acc.device)
+    assert calls["prompts"] == [""]
+    # hiddens[0][mask[0]] gathers the first 2 (valid) of 3 token rows -> shape (2, L=1, D=2)
+    assert torch.equal(trainer._teacher_uncond_embed, torch.tensor([[[1.0, 2.0]], [[3.0, 4.0]]]))
+
+
+def test_on_train_start_skips_uncond_embed_when_cfg_disabled(monkeypatch):
+    def fail_load(*a, **kw):
+        raise AssertionError("load_krea2_text_encoder should not be called when CFG is disabled")
+
+    monkeypatch.setattr(tdm_module.krea2_utils, "load_krea2_text_encoder", fail_load)
+
+    trainer = Krea2TdmDistillNetworkTrainer()
+    args = make_args(tdm_guidance_scale=1.0, optimizer_type="AdamW")
+    net = StubLoraNetwork()
+    net.load_weights = lambda path: "ok"
+    acc = FakeAccelerator()
+
+    trainer.handle_model_specific_args(args)
+    trainer.on_train_start(args, acc, net, None, None)
+
+    assert trainer._teacher_uncond_embed is None
