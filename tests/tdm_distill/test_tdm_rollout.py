@@ -13,6 +13,8 @@ def test_student_rollout_returns_correct_lengths_and_finite(tiny_k2_model):
 
     class DummyArgs:
         gradient_checkpointing = False
+        tdm_distill = False
+        blocks_to_swap = 0
 
     trajectory, timesteps = trainer._student_rollout(
         DummyArgs(),
@@ -40,6 +42,8 @@ def test_student_rollout_uses_batch_latent_resolution(tiny_k2_model):
 
     class DummyArgs:
         gradient_checkpointing = False
+        tdm_distill = False
+        blocks_to_swap = 0
 
     trajectory, _ = trainer._student_rollout(
         DummyArgs(),
@@ -64,6 +68,8 @@ def test_student_rollout_no_grad_before_grad_from_step(tiny_k2_model):
 
     class DummyArgs:
         gradient_checkpointing = False
+        tdm_distill = False
+        blocks_to_swap = 0
 
     trajectory, _ = trainer._student_rollout(
         DummyArgs(),

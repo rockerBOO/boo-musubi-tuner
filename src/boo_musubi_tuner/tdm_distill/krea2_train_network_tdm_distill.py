@@ -173,6 +173,35 @@ class Krea2TdmDistillNetworkTrainer(Krea2NetworkTrainer):
         # process_batch already guarantees that, so this is normally a no-op.
         self._role_switcher.use_student()
 
+    def call_dit(
+        self,
+        args: argparse.Namespace,
+        accelerator: Accelerator,
+        transformer,
+        latents: torch.Tensor,
+        batch: dict,
+        noise: torch.Tensor,
+        noisy_model_input: torch.Tensor,
+        timesteps: torch.Tensor,
+        network_dtype,
+        **kwargs,
+    ):
+        """Extends Krea2NetworkTrainer.call_dit.
+
+        TDM's process_batch calls this multiple times per training step (student rollout steps,
+        fake-score, teacher, updated fake-score) with only one backward in between. ModelOffloader's
+        block-swap ring assumes one forward is immediately followed by its own backward -- by the
+        second call in a step, blocks the first call swapped out have nothing to swap them back in
+        yet, so the next forward hits a CPU-resident block and crashes. Resetting block placement to
+        its canonical layout before every forward (the same reset every *_generate_*.py script does
+        before a fresh forward) sidesteps the ring's forward/backward coupling entirely.
+        """
+        if args.tdm_distill and args.blocks_to_swap:
+            accelerator.unwrap_model(transformer).prepare_block_swap_before_forward()
+        return super().call_dit(
+            args, accelerator, transformer, latents, batch, noise, noisy_model_input, timesteps, network_dtype, **kwargs
+        )
+
     def _student_rollout(
         self,
         args,
@@ -325,27 +354,16 @@ class Krea2TdmDistillNetworkTrainer(Krea2NetworkTrainer):
         lambda_tau = t_i_plus_1 - t_i
         x_revised = revised_sample(x_ti.detach(), real_score, fake_score_updated, lambda_tau).detach()
 
-        # 5. student loss: re-run the single Euler step landing on x_ti, now with grad and with the
-        #    student role live, so the graph handed back to the outer loop's backward() is the last
-        #    thing built and no weight swap follows it. Numerically identical to step 1's x_ti (same
-        #    weights, same inputs) — only the graph differs.
+        # 5. student role goes live now, once, and stays live through both the diversity term's
+        #    rollout (if enabled) and the student loss forward below. LoraRoleSwitcher.use_student()
+        #    calls load_state_dict on the live LoRA weights, which bumps their version counters --
+        #    calling it again after a graph has been built over those weights would make the outer
+        #    loop's deferred backward() raise "variable needed for gradient computation has been
+        #    modified by an inplace operation". So it must run exactly once here, before anything
+        #    that needs student weights with grad.
         switcher.use_student()
-        timesteps_i = torch.full((x_i.shape[0],), t_i * 1000.0, device=device, dtype=torch.float32)
-        student_pred = self.call_dit(
-            args, accelerator, transformer, x_i, batch, trajectory[0], x_i, timesteps_i, network_dtype
-        ).pred
-        x_ti_student = x_i + (t_i_plus_1 - t_i) * student_pred
 
-        data_dim = x_ti.shape[1:].numel()
-        loss = pseudo_huber_loss(x_ti_student, x_revised, c=pseudo_huber_c(data_dim))
-
-        loss_metrics = {
-            "loss/tdm": loss.detach().item(),
-            "loss/fake_score": fake_score_loss.detach().item(),
-            "tdm/k": float(num_steps),
-            "tdm/interval": float(interval),
-        }
-
+        div_loss = None
         if args.tdm_diversity_weight > 0.0 and vae is not None:
             if self._dinov3_embedder is None:
                 from boo_musubi_tuner.tdm_distill.tdm_distill import Dinov3ImageEmbedder
@@ -358,8 +376,14 @@ class Krea2TdmDistillNetworkTrainer(Krea2NetworkTrainer):
             # torch.no_grad() around the decode, and embed_differentiable instead of embed() (which
             # is @torch.no_grad() and takes numpy images — both graph-severing). The VAE's own
             # params are frozen and in no optimizer, but the decode *operation* still has to run
-            # with grad so pixels carry a graph back to final_latent. Safe to run grad-enabled here
-            # because we are past every LoraRoleSwitcher swap (student role is live from step 5).
+            # with grad so pixels carry a graph back to final_latent.
+            #
+            # This rollout runs *before* the student loss forward below (not after) so that the
+            # last forward pass in this function is the one whose graph accelerator.backward(loss)
+            # actually walks. With block swap + gradient checkpointing, backward's recompute needs
+            # the block-swap ring in exactly the state its own forward left it in; any later forward
+            # pass (this rollout, if it ran after) repositions blocks for its own purposes and
+            # desyncs that ring before backward gets to it.
             group_trajectory, _ = self._student_rollout(
                 args,
                 accelerator,
@@ -397,6 +421,27 @@ class Krea2TdmDistillNetworkTrainer(Krea2NetworkTrainer):
             pixel_batch = torch.clamp(pixels.float(), 0.0, 1.0)
             embeddings = self._dinov3_embedder.embed_differentiable(pixel_batch)
             div_loss = diversity_loss_from_embeddings(embeddings)
+
+        # 6. student loss: re-run the single Euler step landing on x_ti, now with grad. This must
+        #    be the last forward pass in process_batch -- see the note on switcher.use_student()
+        #    and the diversity rollout above for why.
+        timesteps_i = torch.full((x_i.shape[0],), t_i * 1000.0, device=device, dtype=torch.float32)
+        student_pred = self.call_dit(
+            args, accelerator, transformer, x_i, batch, trajectory[0], x_i, timesteps_i, network_dtype
+        ).pred
+        x_ti_student = x_i + (t_i_plus_1 - t_i) * student_pred
+
+        data_dim = x_ti.shape[1:].numel()
+        loss = pseudo_huber_loss(x_ti_student, x_revised, c=pseudo_huber_c(data_dim))
+
+        loss_metrics = {
+            "loss/tdm": loss.detach().item(),
+            "loss/fake_score": fake_score_loss.detach().item(),
+            "tdm/k": float(num_steps),
+            "tdm/interval": float(interval),
+        }
+
+        if div_loss is not None:
             loss = loss + args.tdm_diversity_weight * div_loss
             # div_loss is a graph-carrying tensor; metrics are plain floats by convention.
             loss_metrics["loss/diversity"] = div_loss.detach().item()
