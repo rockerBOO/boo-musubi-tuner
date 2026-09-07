@@ -21,6 +21,8 @@ from musubi_tuner.krea2 import krea2_sampling, krea2_utils
 from musubi_tuner.krea2_train_network import Krea2NetworkTrainer, krea2_setup_parser
 from safetensors.torch import load_file
 
+from boo_musubi_tuner.diversity.diversity import Dinov3ImageEmbedder, diversity_loss_from_embeddings
+
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
@@ -254,6 +256,80 @@ class Krea2DinoDiversityNetworkTrainer(Krea2NetworkTrainer):
                 img = img + (tprev - tcurr) * output.pred
             trajectory.append(img)
         return trajectory, list(ts)
+
+    def process_batch(
+        self,
+        args: argparse.Namespace,
+        accelerator: Accelerator,
+        transformer,
+        network,
+        batch: dict,
+        latents,
+        noise,
+        noise_scheduler,
+        dit_dtype,
+        network_dtype,
+        vae,
+        global_step: int,
+    ) -> "tuple[torch.Tensor, dict]":
+        """Standalone diversity step: build a same-prompt group, roll it out, decode, embed,
+        and return the group-diversity loss as the entire training loss. No distillation math
+        at all -- `latents`/`noise` args are ignored, only batch["krea2_vl_embed"] is used."""
+        if not args.dino_diversity:
+            return super().process_batch(
+                args,
+                accelerator,
+                transformer,
+                network,
+                batch,
+                latents,
+                noise,
+                noise_scheduler,
+                dit_dtype,
+                network_dtype,
+                vae,
+                global_step,
+            )
+
+        device = accelerator.device
+        group_size = args.dino_diversity_group_size
+        single_prompt_batch = {
+            "krea2_vl_embed": [batch["krea2_vl_embed"][0]] * group_size,
+            "latents": batch["latents"][:1].repeat(group_size, *([1] * (batch["latents"].dim() - 1))),
+        }
+
+        if self._dinov3_embedder is None:
+            self._dinov3_embedder = Dinov3ImageEmbedder(device=str(device))
+
+        if not self._vae_frozen and hasattr(vae, "parameters"):
+            for p in vae.parameters():
+                p.requires_grad_(False)
+            self._vae_frozen = True
+
+        trajectory, _ts = self._rollout(
+            args,
+            accelerator,
+            transformer,
+            single_prompt_batch,
+            device=device,
+            dit_dtype=dit_dtype,
+            network_dtype=network_dtype,
+        )
+        final_latent = trajectory[-1]
+
+        vae.to(device)
+        pixels = vae.decode_to_pixels(final_latent.to(vae.dtype))
+        self._vae_ref = vae
+        self._vae_needs_cpu_return = True
+        pixel_batch = torch.clamp(pixels.float(), 0.0, 1.0)
+        embeddings = self._dinov3_embedder.embed_differentiable(pixel_batch)
+        div_loss = diversity_loss_from_embeddings(embeddings)
+
+        loss_metrics = {
+            "loss/diversity": div_loss.detach().item(),
+            "diversity/score": -div_loss.detach().item(),
+        }
+        return div_loss, loss_metrics
 
 
 def dino_diversity_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
