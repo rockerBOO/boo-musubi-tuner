@@ -306,6 +306,20 @@ class Krea2DinoDiversityNetworkTrainer(Krea2NetworkTrainer):
                 p.requires_grad_(False)
             self._vae_frozen = True
 
+        if args.dino_diversity_memory_efficient:
+            div_loss_value = self._diversity_loss_memory_efficient(
+                args, accelerator, transformer, single_prompt_batch, vae, device, dit_dtype, network_dtype
+            )
+            loss_metrics = {
+                "loss/diversity": div_loss_value,
+                "diversity/score": -div_loss_value,
+            }
+            # Backward already happened inside _diversity_loss_memory_efficient (per-sample).
+            # Return a zero tensor so the outer training loop's loss.backward() is a harmless
+            # no-op (0 has no gradient contribution) rather than double-applying the diversity
+            # gradient.
+            return torch.zeros((), device=device, requires_grad=False), loss_metrics
+
         trajectory, _ts = self._rollout(
             args,
             accelerator,
@@ -330,6 +344,68 @@ class Krea2DinoDiversityNetworkTrainer(Krea2NetworkTrainer):
             "diversity/score": -div_loss.detach().item(),
         }
         return div_loss, loss_metrics
+
+    def _diversity_loss_memory_efficient(
+        self, args, accelerator, transformer, single_prompt_batch, vae, device, dit_dtype, network_dtype
+    ) -> float:
+        """Two-pass, per-sample gradient accumulation: pass 1 (no_grad, whole group batched) gets
+        the embeddings needed to compute the real pairwise loss and its gradient w.r.t. each
+        embedding; pass 2 (grad, one sample at a time) reuses pass 1's exact noise draw per sample
+        to re-derive each embedding differentiably and backprops the cached upstream gradient into
+        just that sample's rollout. Mathematically identical gradient to the batched path, bounded
+        peak VRAM. Backward happens here, per-sample -- the caller must not call .backward() again
+        on this method's return value."""
+        group_size = args.dino_diversity_group_size
+        model = accelerator.unwrap_model(transformer)
+        lat_h = single_prompt_batch["latents"].shape[-2]
+        lat_w = single_prompt_batch["latents"].shape[-1]
+        noise_batch = torch.randn(group_size, model.config.channels, 1, lat_h, lat_w, device=device, dtype=dit_dtype)
+
+        with torch.no_grad():
+            trajectory, _ts = self._rollout(
+                args,
+                accelerator,
+                transformer,
+                single_prompt_batch,
+                device=device,
+                dit_dtype=dit_dtype,
+                network_dtype=network_dtype,
+                noise=noise_batch,
+            )
+            vae.to(device)
+            pixels = vae.decode_to_pixels(trajectory[-1].to(vae.dtype))
+            pixel_batch = torch.clamp(pixels.float(), 0.0, 1.0)
+            embeddings_nograd = self._dinov3_embedder.embed_differentiable(pixel_batch)
+
+        self._vae_ref = vae
+        self._vae_needs_cpu_return = True
+
+        embeddings_leaf = embeddings_nograd.detach().clone().requires_grad_(True)
+        unweighted_div_loss = diversity_loss_from_embeddings(embeddings_leaf)
+        upstream_grad = torch.autograd.grad(unweighted_div_loss, embeddings_leaf)[0]
+
+        for i in range(group_size):
+            sample_batch = {
+                "krea2_vl_embed": [single_prompt_batch["krea2_vl_embed"][i]],
+                "latents": single_prompt_batch["latents"][i : i + 1],
+            }
+            sample_trajectory, _ts = self._rollout(
+                args,
+                accelerator,
+                transformer,
+                sample_batch,
+                device=device,
+                dit_dtype=dit_dtype,
+                network_dtype=network_dtype,
+                noise=noise_batch[i : i + 1],
+            )
+            vae.to(device)
+            sample_pixels = vae.decode_to_pixels(sample_trajectory[-1].to(vae.dtype))
+            sample_pixel_batch = torch.clamp(sample_pixels.float(), 0.0, 1.0)
+            sample_embedding = self._dinov3_embedder.embed_differentiable(sample_pixel_batch)
+            accelerator.backward(sample_embedding, gradient=upstream_grad[i : i + 1])
+
+        return unweighted_div_loss.detach().item()
 
 
 def dino_diversity_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
