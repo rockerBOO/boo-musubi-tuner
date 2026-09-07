@@ -147,19 +147,10 @@ class Krea2DinoDiversityNetworkTrainer(Krea2NetworkTrainer):
 
         self._dinov3_embedder = None
 
-        budget = args.dino_diversity_step_count * args.dino_diversity_group_size
-        if budget > 16:
-            logger.warning(
-                f"DINOv3 diversity term: --dino_diversity_step_count={args.dino_diversity_step_count} * "
-                f"--dino_diversity_group_size={args.dino_diversity_group_size} = {budget} simultaneous "
-                "sample-forwards with retained activations for the diversity rollout. This is the "
-                "single largest activation consumer in the step and sets peak VRAM; consider lowering "
-                "one of these flags if you hit OOM. (Heuristic threshold, not a hard limit.)"
-            )
-
         logger.info(
-            f"DINOv3 diversity fine-tuning enabled: step_count={args.dino_diversity_step_count}, "
-            f"group_size={args.dino_diversity_group_size}"
+            f"dino_diversity enabled: group_size={args.dino_diversity_group_size}, "
+            f"step_count={args.dino_diversity_step_count}, "
+            f"memory_efficient={args.dino_diversity_memory_efficient}"
         )
 
     def on_post_optimizer_step(
@@ -219,7 +210,6 @@ class Krea2DinoDiversityNetworkTrainer(Krea2NetworkTrainer):
         accelerator: Accelerator,
         transformer,
         batch: dict,
-        num_steps: int,
         device,
         dit_dtype,
         network_dtype,
@@ -250,7 +240,7 @@ class Krea2DinoDiversityNetworkTrainer(Krea2NetworkTrainer):
         imglen = (lat_h // patch) * (lat_w // patch)
         x1 = (256 // (8 * patch)) ** 2
         x2 = (1280 // (8 * patch)) ** 2
-        ts = krea2_sampling.timesteps(imglen, num_steps, x1, x2, y1=0.5, y2=1.15, mu=1.15)
+        ts = krea2_sampling.timesteps(imglen, args.dino_diversity_step_count, x1, x2, y1=0.5, y2=1.15, mu=1.15)
 
         img = noise
         trajectory = [img]

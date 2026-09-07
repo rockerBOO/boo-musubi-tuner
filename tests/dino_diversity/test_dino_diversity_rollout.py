@@ -5,7 +5,7 @@ graph since the whole trajectory feeds the diversity loss."""
 import torch
 
 from boo_musubi_tuner.dino_diversity.krea2_train_network_dino_diversity import Krea2DinoDiversityNetworkTrainer
-from tests.dino_diversity.conftest import FakeAccelerator
+from tests.dino_diversity.conftest import FakeAccelerator, StubLoraNetwork
 from tests.self_flow.conftest_k2_self_flow import make_k2_batch
 
 from .test_dino_diversity_arg_validation import make_args
@@ -15,6 +15,14 @@ class DummyArgs:
     gradient_checkpointing = False
     dino_diversity = False
     blocks_to_swap = 0
+    dino_diversity_step_count = 4
+
+
+def _attach_stub_lora(model, net):
+    def hook(_module, _inputs, output):
+        return output + net.multiplier * 0.01 * (net.lora_w * net.lora_w).sum()
+
+    return model.register_forward_hook(hook)
 
 
 def test_rollout_returns_correct_lengths_and_finite(tiny_k2_model):
@@ -28,7 +36,6 @@ def test_rollout_returns_correct_lengths_and_finite(tiny_k2_model):
         acc,
         tiny_k2_model,
         batch,
-        num_steps=4,
         device="cpu",
         dit_dtype=torch.float32,
         network_dtype=torch.float32,
@@ -44,14 +51,15 @@ def test_rollout_uses_batch_latent_resolution(tiny_k2_model):
     torch.manual_seed(0)
     trainer = Krea2DinoDiversityNetworkTrainer()
     acc = FakeAccelerator()
+    args = DummyArgs()
+    args.dino_diversity_step_count = 2
     batch, _, _ = make_k2_batch(B=1, H=12, W=16, n_txt=3)
 
     trajectory, _ = trainer._rollout(
-        DummyArgs(),
+        args,
         acc,
         tiny_k2_model,
         batch,
-        num_steps=2,
         device="cpu",
         dit_dtype=torch.float32,
         network_dtype=torch.float32,
@@ -75,7 +83,6 @@ def test_rollout_is_fully_grad_enabled_at_every_step(tiny_k2_model):
         acc,
         tiny_k2_model,
         batch,
-        num_steps=4,
         device="cpu",
         dit_dtype=torch.float32,
         network_dtype=torch.float32,
@@ -87,10 +94,37 @@ def test_rollout_is_fully_grad_enabled_at_every_step(tiny_k2_model):
         assert x.requires_grad is True
 
 
+def test_rollout_is_fully_differentiable(tiny_k2_model):
+    """Genuine backward-pass proof: attach a stub LoRA hook whose output depends on a trainable
+    parameter, run the rollout, and confirm gradient actually reaches that parameter -- a bare
+    requires_grad check would not catch a broken/detached graph."""
+    torch.manual_seed(0)
+    trainer = Krea2DinoDiversityNetworkTrainer()
+    acc = FakeAccelerator()
+    batch, _, _ = make_k2_batch(B=1, H=8, W=8, n_txt=3)
+    net = StubLoraNetwork(init_value=1.0)
+    handle = _attach_stub_lora(tiny_k2_model, net)
+
+    trajectory, _ = trainer._rollout(
+        DummyArgs(),
+        acc,
+        tiny_k2_model,
+        batch,
+        device="cpu",
+        dit_dtype=torch.float32,
+        network_dtype=torch.float32,
+    )
+    handle.remove()
+
+    assert trajectory[-1].requires_grad
+    trajectory[-1].sum().backward()
+    assert net.lora_w.grad is not None
+
+
 def test_rollout_uses_supplied_noise_instead_of_drawing_fresh(tiny_k2_model):
     torch.manual_seed(0)
     trainer = Krea2DinoDiversityNetworkTrainer()
-    args = make_args()
+    args = make_args(dino_diversity_step_count=2)
     trainer.handle_model_specific_args(args)
     acc = FakeAccelerator()
     batch, _latents, _noise = make_k2_batch(B=1, H=8, W=8, n_txt=3)
@@ -102,7 +136,6 @@ def test_rollout_uses_supplied_noise_instead_of_drawing_fresh(tiny_k2_model):
         acc,
         tiny_k2_model,
         batch,
-        num_steps=2,
         device=torch.device("cpu"),
         dit_dtype=torch.float32,
         network_dtype=torch.float32,
@@ -114,7 +147,7 @@ def test_rollout_uses_supplied_noise_instead_of_drawing_fresh(tiny_k2_model):
 def test_rollout_draws_fresh_noise_when_not_supplied(tiny_k2_model):
     torch.manual_seed(0)
     trainer = Krea2DinoDiversityNetworkTrainer()
-    args = make_args()
+    args = make_args(dino_diversity_step_count=2)
     trainer.handle_model_specific_args(args)
     acc = FakeAccelerator()
     batch, _latents, _noise = make_k2_batch(B=1, H=8, W=8, n_txt=3)
@@ -124,7 +157,6 @@ def test_rollout_draws_fresh_noise_when_not_supplied(tiny_k2_model):
         acc,
         tiny_k2_model,
         batch,
-        num_steps=2,
         device=torch.device("cpu"),
         dit_dtype=torch.float32,
         network_dtype=torch.float32,
