@@ -8,10 +8,16 @@ Internal extension point — no API stability guarantees. Experimental.
 """
 
 import argparse
+import importlib
 import logging
+import os
+import sys
 
+from accelerate import Accelerator
 from musubi_tuner.hv_train_network import read_config_from_file, setup_parser_common
+from musubi_tuner.krea2 import krea2_utils
 from musubi_tuner.krea2_train_network import Krea2NetworkTrainer, krea2_setup_parser
+from safetensors.torch import load_file
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -73,6 +79,57 @@ class Krea2DinoDiversityNetworkTrainer(Krea2NetworkTrainer):
                 "--dataset_config is required (this pass runs through the base trainer's dataloader/"
                 "sampling machinery for now, even though real cached latents are never used as training content)."
             )
+
+    def _build_network(self, args: argparse.Namespace, accelerator: Accelerator, transformer, vae, weight_dtype):
+        if not args.dino_diversity:
+            return super()._build_network(args, accelerator, transformer, vae, weight_dtype)
+
+        # Mirrors trainer_base.py's own sys.path setup in _build_network, which lets short module
+        # paths like `networks.lora_krea2` (relative to the musubi_tuner package dir) resolve. We
+        # can't reuse that method here since it always builds a single-uniform-rank network from
+        # --network_dim/--network_alpha; dino_diversity's warm-start LoRA is not guaranteed to be
+        # uniform-rank across modules, so the network must be shaped from the weights file itself.
+        sys.path.append(os.path.dirname(os.path.dirname(krea2_utils.__file__)))
+        accelerator.print("import network module:", args.network_module)
+        network_module = importlib.import_module(args.network_module)
+
+        weights_sd = load_file(args.dino_diversity_lora_init)
+        network = network_module.create_arch_network_from_weights(1.0, weights_sd, unet=transformer)
+
+        # create_arch_network_from_weights (the "from weights" construction path) never forwards
+        # dropout kwargs into LoRANetwork -- true of musubi-tuner's own --dim_from_weights path too
+        # (trainer_base.py calls the same function with no net_kwargs), not something specific to
+        # this trainer. --network_args's rank_dropout/module_dropout (the standard mechanism
+        # elsewhere) are consequently inert here. LoRAModule reads dropout/rank_dropout/
+        # module_dropout as plain instance attributes at forward time (see lora.py's
+        # LoRAModule.forward), so setting them directly on each already-constructed module after
+        # the fact applies them without needing a different construction path.
+        net_kwargs = {}
+        if args.network_args is not None:
+            for net_arg in args.network_args:
+                key, value = net_arg.split("=")
+                net_kwargs[key] = value
+        rank_dropout = net_kwargs.get("rank_dropout")
+        module_dropout = net_kwargs.get("module_dropout")
+        if args.network_dropout is not None or rank_dropout is not None or module_dropout is not None:
+            for lora_module in network.unet_loras:
+                lora_module.dropout = args.network_dropout
+                lora_module.rank_dropout = float(rank_dropout) if rank_dropout is not None else None
+                lora_module.module_dropout = float(module_dropout) if module_dropout is not None else None
+
+        if hasattr(network_module, "prepare_network"):
+            network.prepare_network(args)
+
+        network.apply_to(None, transformer, apply_text_encoder=False, apply_unet=True)
+
+        info = network.load_weights(args.dino_diversity_lora_init)
+        accelerator.print(f"loaded DINOv3 diversity LoRA warm-start weights from {args.dino_diversity_lora_init}: {info}")
+
+        if args.gradient_checkpointing:
+            transformer.enable_gradient_checkpointing(args.gradient_checkpointing_cpu_offload)
+            network.enable_gradient_checkpointing()
+
+        return network
 
 
 def dino_diversity_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
