@@ -4,7 +4,9 @@ Experimental Krea 2 (K2) extension implementing Trajectory Distribution Matching
 guidance+step distillation, with a DINOv3 group-diversity term folded into the student's loss to
 counteract the diversity loss guidance distillation otherwise causes. Warm-starts the student and
 an auxiliary fake-score critic from an existing K2 Turbo LoRA rather than training from scratch,
-distilling against the frozen K2 raw model's true multi-step trajectory.
+matching the frozen K2 raw model's score at a sampled point along the student's own trajectory
+(the teacher itself is never rolled out — it is evaluated once, or twice under CFG, per training
+step, at a single `tau`).
 
 **Source material**: [Krea 2 technical report](https://www.krea.ai/blog/krea-2-technical-report);
 [Trajectory Distribution Matching (TDM), arXiv:2503.06674](https://arxiv.org/abs/2503.06674).
@@ -70,6 +72,11 @@ the student learns — it is not a passive/logging-only metric computed on the s
 - **Single-GPU bf16 only**: two `accelerator.prepare`d optimizers sharing one `GradScaler` under fp16
   mixed precision, or running under multi-GPU/DDP, is untested and likely broken (the extra backward
   pass per step confuses DDP's gradient reducer, and fp16 grad scaling gets double-updated).
+- **Block swap (`--blocks_to_swap > 0`) is implemented but untested**: `call_dit` resets block
+  placement to its canonical layout before every forward (see the docstring there) to work around
+  `ModelOffloader`'s single forward/backward-per-step assumption, which this trainer's multiple
+  forwards per step (student rollout, fake-score, teacher, updated fake-score) violate. No test
+  exercises `blocks_to_swap > 0` in this extension.
 - **Teacher CFG requires `--text_encoder`**: when `--tdm_guidance_scale > 1.0`, `on_train_start`
   loads the Qwen3-VL encoder once to build a cached unconditional (empty-prompt) embedding, then
   frees it — same pattern as `--sample_prompts` encoding. `--tdm_guidance_scale <= 1.0` disables
@@ -79,8 +86,15 @@ the student learns — it is not a passive/logging-only metric computed on the s
   velocity-space critic target from the standard min-SNR weighting strategy (Hang et al. 2023).
   The official TDM implementation also applies an importance-sampling correction on top of this,
   but that term corrects for a bias specific to *their* two-hop, model-dependent noise
-  construction; this module's `x_tau` is sampled in a single hop with a fresh random Gaussian
-  draw, which is already unbiased, so no such correction applies here.
+  construction. We believe no such correction applies here because this module's `x_tau` is
+  sampled in a single hop with a fresh random Gaussian draw, which is unbiased *given* `tau` — but
+  this is a qualified claim, not a proven one: `tau` here is not drawn from the continuous
+  distribution the paper's derivation assumes. It is deterministically the midpoint of a
+  uniformly-drawn interval on a `mu=1.15`-shifted `K`-step grid, i.e. a `K`-dependent discrete comb
+  whose shape changes every time `sample_step_count` redraws `K`. This interaction between the
+  discrete-comb `tau` distribution and the omitted importance-sampling term has not been
+  empirically validated. `tdm/tau` and `tdm/omega_tau` are logged per step (see
+  `process_batch`'s `loss_metrics`) so the interaction is observable in a real run.
 - **Not annealed**: `--tdm_diversity_weight` should be left constant throughout training — Krea's
   own report found annealing this weight toward zero caused diversity to collapse quickly.
 - **VAE stays resident on the training device for the whole step when the diversity term runs**:
@@ -93,14 +107,20 @@ the student learns — it is not a passive/logging-only metric computed on the s
   step. This holds the full VAE resident on-device for an extra portion of every step, on top of
   the resident transformer — a real, additional VRAM cost while `--tdm_diversity_weight > 0`
   (separate from and in addition to the generic "one resident transformer" cost below).
-- **Extra grad-enabled forward pass per training step**: the student rollout used for the
-  diversity term must be fully grad-enabled from step 0 (`grad_from_step=0`) so gradient reaches
-  every step of the trajectory, unlike the main TDM rollout (which only needs its last step
-  differentiated — see `_student_rollout`'s `grad_from_step` parameter and the version-counter
-  hazard noted there). This adds roughly one extra full-trajectory transformer rollout per
-  training step beyond what a single-pass TDM step needs, when the diversity term is enabled.
+- **Extra grad-enabled forward pass per training step, and it is the dominant VRAM cost**: the
+  student rollout used for the diversity term must be fully grad-enabled from step 0
+  (`grad_from_step=0`) so gradient reaches every step of the trajectory, unlike the main TDM
+  rollout (which only needs its last step differentiated — see `_student_rollout`'s
+  `grad_from_step` parameter and the version-counter hazard noted there). This rollout runs at
+  batch size `--tdm_diversity_group_size` (default 4) for up to `max(--tdm_step_counts)` steps
+  (default 8) — up to 32 sample-forwards with retained activations held simultaneously, not "one
+  extra rollout" in any small sense. Peak VRAM from this term scales multiplicatively with
+  `K * group_size`, where `K` is redrawn every iteration from `--tdm_step_counts`; it is the
+  single largest activation consumer in the step whenever the diversity term is enabled. A
+  startup warning fires when `max(--tdm_step_counts) * --tdm_diversity_group_size` exceeds a
+  heuristic threshold (16) so this is visible before training starts.
 - **VRAM**: one resident transformer plus a VAE decode + DINOv3 forward pass added to every
-  training step for the diversity term (see the two bullets above for the specific costs).
+  training step for the diversity term (see the bullet above for the dominant cost).
 - **Experimental**: no correctness guarantee against the TDM paper's own results; K2 is not an
   architecture the paper evaluates.
 - **DINOv3 gate**: `facebook/dinov3-vitb16-pretrain-lvd1689m` requires one-time Hugging Face license

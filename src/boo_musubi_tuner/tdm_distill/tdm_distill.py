@@ -55,7 +55,7 @@ def fake_score_denoising_loss(
     return (omega_tau * (fake_score_pred - target) ** 2).mean()
 
 
-def min_snr_weight(tau: "float | torch.Tensor", gamma: float = 5.0) -> "float | torch.Tensor":
+def min_snr_weight(tau: float, gamma: float = 5.0) -> float:
     """Min-SNR-clamped timestep importance weight (omega_tau, TDM Eq. 7), re-derived for this
     module's velocity-space critic target (v = eps - x0, under x_tau = (1-tau)*x0 + tau*eps).
     Provably equivalent to running gamma-clamped min-SNR (Hang et al. 2023) on an x0-space loss:
@@ -80,8 +80,9 @@ def sample_trajectory_interval(num_steps: int, generator: "torch.Generator | Non
 
 def pairwise_cosine_diversity(embeddings: torch.Tensor) -> float:
     """Mean pairwise cosine distance (1 - cosine_similarity) across all unordered pairs of rows
-    in embeddings (N, D). Higher = more diverse. Ported from the krea2-diversity probe project's
-    identical metric (see docs/tdm-distill.md)."""
+    in embeddings (N, D). Higher = more diverse. This is the non-differentiable, metric-only
+    form (ends in .item()); diversity_loss_from_embeddings below duplicates this math in a
+    graph-preserving form for use as an actual training loss."""
     n = embeddings.shape[0]
     if n < 2:
         raise ValueError(f"pairwise_cosine_diversity requires N >= 2 embeddings, got N={n}")
@@ -173,10 +174,11 @@ def diversity_loss_from_embeddings(embeddings: torch.Tensor) -> torch.Tensor:
 
 
 class Dinov3ImageEmbedder:
-    """Wraps a DINOv3 backbone for image-only embedding extraction (CLS token). Ported from the
-    krea2-diversity probe project's identical class — requires one-time Hugging Face license
-    acceptance for facebook/dinov3-vitb16-pretrain-lvd1689m plus `huggingface-cli login` before
-    first use; no unit test here (integration-only, see docs/tdm-distill.md)."""
+    """Wraps a DINOv3 backbone for image-only embedding extraction (CLS token). Requires
+    one-time Hugging Face license acceptance for facebook/dinov3-vitb16-pretrain-lvd1689m plus
+    `huggingface-cli login` (or `hf auth login`) before first use. No unit test here: constructing
+    it downloads real pretrained weights, so it is exercised only by integration/manual runs, not
+    the CPU-only test suite."""
 
     def __init__(self, model_name: str = "facebook/dinov3-vitb16-pretrain-lvd1689m", device: str = "cuda"):
         self.device = device
@@ -197,14 +199,6 @@ class Dinov3ImageEmbedder:
         self.image_size = int(size.get("height") or size.get("shortest_edge") or 224)
         self.image_mean = list(getattr(self.processor, "image_mean", None) or [0.485, 0.456, 0.406])
         self.image_std = list(getattr(self.processor, "image_std", None) or [0.229, 0.224, 0.225])
-
-    @torch.no_grad()
-    def embed(self, images: list) -> torch.Tensor:
-        """Non-differentiable convenience path for inference/eval over PIL/numpy images.
-        Training code that needs gradient must use embed_differentiable instead."""
-        inputs = self.processor(images=images, return_tensors="pt").to(self.device)
-        outputs = self.model(**inputs)
-        return outputs.last_hidden_state[:, 0, :].cpu()
 
     def embed_differentiable(self, pixel_values: torch.Tensor) -> torch.Tensor:
         """Embed an already-decoded (N, C, H, W) float tensor in [0, 1] (already on self.device),

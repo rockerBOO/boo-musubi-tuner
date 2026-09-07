@@ -1,6 +1,6 @@
-"""Diversity-term tests. Dinov3ImageEmbedder itself is integration-only (real model download,
-no unit test — mirrors the krea2-diversity probe project's Task 4 precedent); this file tests
-only the pure-tensor group-diversity-loss composition."""
+"""Diversity-term tests. Dinov3ImageEmbedder itself is integration-only (constructing it
+downloads real pretrained weights, so it has no unit test here); this file tests only the
+pure-tensor group-diversity-loss composition."""
 
 import torch
 

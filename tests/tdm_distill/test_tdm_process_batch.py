@@ -273,7 +273,7 @@ def test_process_batch_cfg_off_single_teacher_forward(tiny_k2_model):
 def test_process_batch_cfg_on_two_teacher_forwards_and_combines(tiny_k2_model, monkeypatch):
     """tdm_guidance_scale > 1.0 must run cond + uncond teacher forwards and combine via cfg_combine."""
     torch.manual_seed(6)
-    # _prepared_trainer's on_train_start runs the real (Task 3) CFG caching path when
+    # _prepared_trainer's on_train_start runs the real CFG uncond-embed caching path when
     # tdm_guidance_scale > 1.0 and text_encoder is set -- stub the encoder load so it doesn't try
     # to read a real file. Shape matches tiny_k2_config's txtlayers=1, txtdim=32.
     monkeypatch.setattr(tdm_module.krea2_utils, "load_krea2_text_encoder", lambda path, dtype, device: object())
