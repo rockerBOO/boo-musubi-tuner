@@ -9,13 +9,15 @@ Internal extension point — no API stability guarantees. Experimental.
 
 import argparse
 import importlib
+import itertools
 import logging
 import os
 import sys
 
+import torch
 from accelerate import Accelerator
 from musubi_tuner.hv_train_network import read_config_from_file, setup_parser_common
-from musubi_tuner.krea2 import krea2_utils
+from musubi_tuner.krea2 import krea2_sampling, krea2_utils
 from musubi_tuner.krea2_train_network import Krea2NetworkTrainer, krea2_setup_parser
 from safetensors.torch import load_file
 
@@ -130,6 +132,138 @@ class Krea2DinoDiversityNetworkTrainer(Krea2NetworkTrainer):
             network.enable_gradient_checkpointing()
 
         return network
+
+    def on_train_start(
+        self,
+        args: argparse.Namespace,
+        accelerator: Accelerator,
+        network,
+        transformer,
+        optimizer,
+    ) -> None:
+        super().on_train_start(args, accelerator, network, transformer, optimizer)
+        if not args.dino_diversity:
+            return
+
+        self._dinov3_embedder = None
+
+        budget = args.dino_diversity_step_count * args.dino_diversity_group_size
+        if budget > 16:
+            logger.warning(
+                f"DINOv3 diversity term: --dino_diversity_step_count={args.dino_diversity_step_count} * "
+                f"--dino_diversity_group_size={args.dino_diversity_group_size} = {budget} simultaneous "
+                "sample-forwards with retained activations for the diversity rollout. This is the "
+                "single largest activation consumer in the step and sets peak VRAM; consider lowering "
+                "one of these flags if you hit OOM. (Heuristic threshold, not a hard limit.)"
+            )
+
+        logger.info(
+            f"DINOv3 diversity fine-tuning enabled: step_count={args.dino_diversity_step_count}, "
+            f"group_size={args.dino_diversity_group_size}"
+        )
+
+    def on_post_optimizer_step(
+        self,
+        args: argparse.Namespace,
+        accelerator: Accelerator,
+        network,
+        transformer,
+        sync_gradients: bool,
+        global_step: int,
+    ) -> None:
+        super().on_post_optimizer_step(args, accelerator, network, transformer, sync_gradients, global_step)
+        if not args.dino_diversity:
+            return
+        # process_batch's diversity rollout leaves the VAE on the training device because its
+        # decode is grad-enabled and the outer loop's backward() runs after process_batch returns.
+        # By now backward() and the optimizer step are done and the graph is dead, so it is safe to
+        # hand the VAE's VRAM back.
+        if self._vae_needs_cpu_return:
+            if self._vae_ref is not None:
+                self._vae_ref.to("cpu")
+            self._vae_ref = None
+            self._vae_needs_cpu_return = False
+
+    def call_dit(
+        self,
+        args: argparse.Namespace,
+        accelerator: Accelerator,
+        transformer,
+        latents: torch.Tensor,
+        batch: dict,
+        noise: torch.Tensor,
+        noisy_model_input: torch.Tensor,
+        timesteps: torch.Tensor,
+        network_dtype,
+        **kwargs,
+    ):
+        """Extends Krea2NetworkTrainer.call_dit.
+
+        _rollout calls this once per Euler step within a single training step (one call per group
+        member's rollout step), with only one backward at the very end. ModelOffloader's block-swap
+        ring assumes one forward is immediately followed by its own backward -- by the second call,
+        blocks the first call swapped out have nothing to swap them back in yet, so the next forward
+        hits a CPU-resident block and crashes. Resetting block placement to its canonical layout
+        before every forward (the same reset every *_generate_*.py script does before a fresh
+        forward) sidesteps the ring's forward/backward coupling entirely.
+        """
+        if args.dino_diversity and args.blocks_to_swap:
+            accelerator.unwrap_model(transformer).prepare_block_swap_before_forward()
+        return super().call_dit(
+            args, accelerator, transformer, latents, batch, noise, noisy_model_input, timesteps, network_dtype, **kwargs
+        )
+
+    def _rollout(
+        self,
+        args: argparse.Namespace,
+        accelerator: Accelerator,
+        transformer,
+        batch: dict,
+        num_steps: int,
+        device,
+        dit_dtype,
+        network_dtype,
+        noise: "torch.Tensor | None" = None,
+    ) -> "tuple[list, list[float]]":
+        """K-step Euler trajectory from noise, using self.call_dit at each step.
+
+        Structurally mirrors the sibling tdm_distill extension's _student_rollout, but always
+        fully grad-enabled: dino_diversity's entire training signal is the group-diversity loss
+        over the rendered images, so every step (including the very first) must stay in the
+        autograd graph. There is no grad_from_step split like TDM's -- TDM only differentiates
+        through the last sampled interval because the rest of its trajectory only needs to exist to
+        reach that interval, not to be trained through; here the whole rollout is what gets scored.
+
+        `noise`, if given, is used as the starting point instead of drawing a fresh one -- lets a
+        caller reproduce an earlier rollout's exact trajectory rather than sampling a different
+        noise draw the second time.
+        """
+        model = accelerator.unwrap_model(transformer)
+        patch = model.config.patch
+        vl_embed = batch["krea2_vl_embed"]
+        bsize = len(vl_embed)
+        # Latents are (B, C, T, H, W) for K2 (single frame, T=1), so H/W are the last two dims.
+        lat_h, lat_w = batch["latents"].shape[-2], batch["latents"].shape[-1]
+
+        if noise is None:
+            noise = torch.randn(bsize, model.config.channels, 1, lat_h, lat_w, device=device, dtype=dit_dtype)
+        imglen = (lat_h // patch) * (lat_w // patch)
+        x1 = (256 // (8 * patch)) ** 2
+        x2 = (1280 // (8 * patch)) ** 2
+        ts = krea2_sampling.timesteps(imglen, num_steps, x1, x2, y1=0.5, y2=1.15, mu=1.15)
+
+        img = noise
+        trajectory = [img]
+        for tcurr, tprev in itertools.pairwise(ts):
+            timesteps_t = torch.full((bsize,), tcurr * 1000.0, device=device, dtype=torch.float32)
+            with torch.enable_grad():
+                output = self.call_dit(args, accelerator, transformer, img, batch, noise, img, timesteps_t, network_dtype)
+                # call_dit's DiTOutput.pred is the model's direct velocity prediction (not yet
+                # compared to a target), so integrate it directly on img -- matches do_inference's
+                # own `img = img + (tprev - tcurr) * v` in krea2_train_network.py.
+                img = img + (tprev - tcurr) * output.pred
+            trajectory.append(img)
+        return trajectory, list(ts)
 
 
 def dino_diversity_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
