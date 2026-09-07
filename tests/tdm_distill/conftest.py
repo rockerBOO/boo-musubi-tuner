@@ -58,8 +58,8 @@ class FakeAccelerator:
     def print(self, *args, **kwargs):
         pass
 
-    def backward(self, loss):
-        loss.backward()
+    def backward(self, loss, gradient=None):
+        loss.backward(gradient=gradient)
 
 
 class StubLoraNetwork(torch.nn.Module):

@@ -425,6 +425,38 @@ class Krea2TdmDistillNetworkTrainer(Krea2NetworkTrainer):
             trajectory.append(img)
         return trajectory, list(ts)
 
+    def _diversity_loss_full(
+        self, args, accelerator, transformer, single_prompt_batch, vae, device, dit_dtype, network_dtype
+    ) -> "tuple[torch.Tensor, bool]":
+        """Batched diversity rollout over the whole group at once (today's only behavior before the
+        memory-efficient alternative existed). Returns (div_loss, False) -- False means the caller
+        still needs to fold div_loss * tdm_diversity_weight into the returned training loss itself."""
+        group_trajectory, _ = self._student_rollout(
+            args,
+            accelerator,
+            transformer,
+            single_prompt_batch,
+            args.tdm_diversity_step_count,
+            grad_from_step=0,
+            device=device,
+            dit_dtype=dit_dtype,
+            network_dtype=network_dtype,
+        )
+        final_latent = group_trajectory[-1]
+        if not self._vae_frozen and hasattr(vae, "parameters"):
+            for p in vae.parameters():
+                p.requires_grad_(False)
+            self._vae_frozen = True
+
+        vae.to(device)
+        pixels = vae.decode_to_pixels(final_latent.to(vae.dtype))
+        self._vae_ref = vae
+        self._vae_needs_cpu_return = True
+        pixel_batch = torch.clamp(pixels.float(), 0.0, 1.0)
+        embeddings = self._dinov3_embedder.embed_differentiable(pixel_batch)
+        div_loss = diversity_loss_from_embeddings(embeddings)
+        return div_loss, False
+
     def process_batch(
         self,
         args: argparse.Namespace,
@@ -570,6 +602,7 @@ class Krea2TdmDistillNetworkTrainer(Krea2NetworkTrainer):
             switcher.use_student()
 
         div_loss = None
+        div_already_backpropped = False
         if args.tdm_diversity_weight > 0.0 and vae is not None:
             if self._dinov3_embedder is None:
                 from boo_musubi_tuner.tdm_distill.tdm_distill import Dinov3ImageEmbedder
@@ -578,58 +611,15 @@ class Krea2TdmDistillNetworkTrainer(Krea2NetworkTrainer):
 
             # This whole chain (rollout -> VAE decode -> DINOv3 embed -> diversity loss) must stay
             # differentiable: the diversity term is a real training signal, so gradient has to reach
-            # the student LoRA weights. Hence grad_from_step=0 (every rollout step grad-enabled), no
-            # torch.no_grad() around the decode, and Dinov3ImageEmbedder.embed_differentiable
-            # (which runs without @torch.no_grad() and takes an already-decoded tensor, not
-            # PIL/numpy images, so it stays graph-preserving end to end). The VAE's own
-            # params are frozen and in no optimizer, but the decode *operation* still has to run
-            # with grad so pixels carry a graph back to final_latent.
-            #
-            # This rollout runs *before* the student loss forward below (not after) so that the
-            # last forward pass in this function is the one whose graph accelerator.backward(loss)
-            # actually walks. With block swap + gradient checkpointing, backward's recompute needs
-            # the block-swap ring in exactly the state its own forward left it in; any later forward
-            # pass (this rollout, if it ran after) repositions blocks for its own purposes and
-            # desyncs that ring before backward gets to it.
-            group_trajectory, _ = self._student_rollout(
-                args,
-                accelerator,
-                transformer,
-                single_prompt_batch,
-                args.tdm_diversity_step_count,  # was: num_steps
-                grad_from_step=0,
-                device=device,
-                dit_dtype=dit_dtype,
-                network_dtype=network_dtype,
+            # the student LoRA weights. This rollout runs *before* the student loss forward below
+            # (not after) so that the last forward pass in this function is the one whose graph
+            # accelerator.backward(loss) actually walks. With block swap + gradient checkpointing,
+            # backward's recompute needs the block-swap ring in exactly the state its own forward
+            # left it in; any later forward pass (this rollout, if it ran after) repositions blocks
+            # for its own purposes and desyncs that ring before backward gets to it.
+            div_loss, div_already_backpropped = self._diversity_loss_full(
+                args, accelerator, transformer, single_prompt_batch, vae, device, dit_dtype, network_dtype
             )
-            final_latent = group_trajectory[-1]
-            # Defensive/redundant: trainer_base.py already does vae.requires_grad_(False) once at
-            # load time, so this re-freeze is not the thing preventing .grad accumulation in the
-            # common case. It is kept because this code cannot rely on that having already run for
-            # every possible vae object reaching this point, and requires_grad_(False) is cheap
-            # and idempotent to repeat. Freeze once, lazily: on_train_start is not handed the vae,
-            # so first use here is the earliest hook that has it.
-            if not self._vae_frozen and hasattr(vae, "parameters"):
-                for p in vae.parameters():
-                    p.requires_grad_(False)
-                self._vae_frozen = True
-
-            # vae is kept on CPU between uses to save VRAM (see load_vae/on_before_sample_images);
-            # move it onto the training device for this decode. Unlike the base trainer's
-            # sample-image decode (krea2_train_network.py), we must NOT move it straight back to
-            # CPU: this decode is grad-enabled and nn.Module.to() rebinds param.data in place on
-            # the very tensors autograd saved for backward. The outer loop's accelerator.backward()
-            # runs *after* process_batch returns, so a CPU round-trip here would crash with a
-            # device mismatch. Instead the VAE stays resident on the training device for the rest
-            # of the step (extra VRAM cost while the diversity term is enabled) and is returned to
-            # CPU in on_post_optimizer_step, once backward has consumed the graph.
-            vae.to(device)
-            pixels = vae.decode_to_pixels(final_latent.to(vae.dtype))  # (group_size, C, H, W) in [0, 1]
-            self._vae_ref = vae
-            self._vae_needs_cpu_return = True
-            pixel_batch = torch.clamp(pixels.float(), 0.0, 1.0)
-            embeddings = self._dinov3_embedder.embed_differentiable(pixel_batch)
-            div_loss = diversity_loss_from_embeddings(embeddings)
 
         # 6. student loss: re-run the single Euler step landing on x_ti, now with grad. This must
         #    be the last forward pass in process_batch -- see the note on switcher.use_student()
@@ -653,7 +643,8 @@ class Krea2TdmDistillNetworkTrainer(Krea2NetworkTrainer):
         }
 
         if div_loss is not None:
-            loss = loss + args.tdm_diversity_weight * div_loss
+            if not div_already_backpropped:
+                loss = loss + args.tdm_diversity_weight * div_loss
             # div_loss is a graph-carrying tensor; metrics are plain floats by convention.
             loss_metrics["loss/diversity"] = div_loss.detach().item()
             loss_metrics["tdm/diversity_score"] = -div_loss.detach().item()
