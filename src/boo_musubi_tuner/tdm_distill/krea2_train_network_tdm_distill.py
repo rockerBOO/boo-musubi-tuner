@@ -381,11 +381,17 @@ class Krea2TdmDistillNetworkTrainer(Krea2NetworkTrainer):
         device,
         dit_dtype,
         network_dtype,
+        noise: "torch.Tensor | None" = None,
     ) -> "tuple[list, list[float]]":
         """K-step Euler trajectory from noise, using self.call_dit at each step so the
         currently-active LoRA role (staged externally via LoraRoleSwitcher) is respected.
         Steps before grad_from_step run under no_grad (cheap — most of the trajectory only
-        needs to exist to reach the sampled interval, not to be differentiated through)."""
+        needs to exist to reach the sampled interval, not to be differentiated through).
+
+        `noise`, if given, is used as the starting point instead of drawing a fresh one -- lets a
+        caller reproduce an earlier rollout's exact trajectory (e.g. TDM's memory-efficient
+        diversity path re-deriving a no-grad pass's embedding differentiably) rather than
+        accidentally sampling a different noise draw the second time."""
         model = accelerator.unwrap_model(transformer)
         patch = model.config.patch
         vl_embed = batch["krea2_vl_embed"]
@@ -393,7 +399,8 @@ class Krea2TdmDistillNetworkTrainer(Krea2NetworkTrainer):
         # Latents are (B, C, T, H, W) for K2 (single frame, T=1), so H/W are the last two dims.
         lat_h, lat_w = batch["latents"].shape[-2], batch["latents"].shape[-1]
 
-        noise = torch.randn(bsize, model.config.channels, 1, lat_h, lat_w, device=device, dtype=dit_dtype)
+        if noise is None:
+            noise = torch.randn(bsize, model.config.channels, 1, lat_h, lat_w, device=device, dtype=dit_dtype)
         imglen = (lat_h // patch) * (lat_w // patch)
         x1 = (256 // (8 * patch)) ** 2
         x2 = (1280 // (8 * patch)) ** 2
