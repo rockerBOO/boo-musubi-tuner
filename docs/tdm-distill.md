@@ -176,3 +176,45 @@ the student learns — it is not a passive/logging-only metric computed on the s
   acceptance plus `huggingface-cli login` (or `hf auth login`) before first use.
 - Not tested in composition with `self_flow` or `explorative_modeling` — combining them is out of
   scope for this extension.
+
+## Diversity evaluation run (500 steps)
+
+To see how the diversity term behaves over a longer run than the mechanical smoke tests above, use
+`scripts/build_diversity_eval_prompts.py` and `scripts/build_diversity_eval_dataset.py` to build a
+300-prompt diverse training pool (from `AIML-TUDA/t2i-diversity-evalprompts`) and a 12-prompt
+`--sample_prompts` subset, then run:
+
+```bash
+LD_PRELOAD=/usr/lib/libmimalloc.so:$LD_PRELOAD \
+PYTHONPATH=/home/rockerboo/code/others/musubi-tuner/src:$PWD/src \
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+uv run --no-sync accelerate launch \
+  src/boo_musubi_tuner/tdm_distill/krea2_train_network_tdm_distill.py \
+  --dit <your DiT path> --vae <your VAE path> --text_encoder <your text encoder path> \
+  --dataset_config notes/tdm-distill-eval-dataset/dataset_config.toml \
+  --sample_prompts notes/tdm-distill-sample-prompts.txt \
+  --sdpa --mixed_precision bf16 --gradient_accumulation_steps 1 \
+  --gradient_checkpointing --gradient_checkpointing_cpu_offload \
+  --convrot_int8 --blocks_to_swap 26 --block_swap_h2d_only --block_swap_ring_size 2 --use_pinned_memory_for_block_swap \
+  --network_module networks.lora_krea2 \
+  --tdm_distill --tdm_turbo_lora_init <your turbo LoRA path> \
+  --tdm_step_counts 2,4,8 --tdm_guidance_scale 5.5 \
+  --tdm_diversity_weight 0.1 --tdm_diversity_group_size 2 \
+  --tdm_diversity_memory_efficient --tdm_diversity_step_count 1 \
+  --optimizer_type AdamW --learning_rate 2e-4 --max_train_steps 500 \
+  --output_dir <your output dir> --output_name tdm_diversity_eval_500 \
+  --save_every_n_steps 100 --sample_every_n_steps 100 \
+  --log_with wandb --logging_dir <your output dir>/logs
+```
+
+This differs from the validated 5-step smoke-test command in three ways: `--tdm_guidance_scale` is
+raised from `3.0` to `5.5` (real distillation CFG, not smoke-test); `--tdm_step_counts` is set to
+`2,4,8` instead of the smoke test's `1` (the turbo LoRA is itself 8-step distilled — `2,4,8` trains
+near that regime; this trainer samples `K` per iteration but does not condition the model on `K`
+itself, so the paper's full step-count-conditioning benefit, per arXiv:2503.06674 Table 5, doesn't
+fully apply here); and `--log_with wandb` is added. `process_batch` already returns `loss/diversity`
+and `tdm/diversity_score` in its `loss_metrics` dict, and musubi-tuner's training loop already merges
+`loss_metrics` into the per-step `logs` dict passed to `accelerator.log` — no trainer code change is
+needed to see the diversity trend across the run's 5 checkpoints in wandb. Diversity (DINOv3-based,
+via `--tdm_diversity_weight`/`--tdm_diversity_group_size`) was already enabled in the smoke tests; this
+run keeps it on unchanged.
