@@ -14,6 +14,7 @@ import itertools
 import logging
 import os
 import sys
+import time
 
 import torch
 from accelerate import Accelerator
@@ -370,7 +371,15 @@ class Krea2TdmDistillNetworkTrainer(Krea2NetworkTrainer):
         before a fresh forward) sidesteps the ring's forward/backward coupling entirely.
         """
         if args.tdm_distill and args.blocks_to_swap:
-            accelerator.unwrap_model(transformer).prepare_block_swap_before_forward()
+            if os.getenv("TDM_DISTILL_DEBUG_BLOCK_RESET") == "1":
+                t0 = time.perf_counter()
+                accelerator.unwrap_model(transformer).prepare_block_swap_before_forward()
+                self._block_reset_count = getattr(self, "_block_reset_count", 0) + 1
+                logger.info(
+                    "call_dit block-swap reset #%d took %.1fms", self._block_reset_count, (time.perf_counter() - t0) * 1000
+                )
+            else:
+                accelerator.unwrap_model(transformer).prepare_block_swap_before_forward()
         return super().call_dit(
             args, accelerator, transformer, latents, batch, noise, noisy_model_input, timesteps, network_dtype, **kwargs
         )

@@ -86,11 +86,30 @@ the student learns — it is not a passive/logging-only metric computed on the s
 - **Single-GPU bf16 only**: two `accelerator.prepare`d optimizers sharing one `GradScaler` under fp16
   mixed precision, or running under multi-GPU/DDP, is untested and likely broken (the extra backward
   pass per step confuses DDP's gradient reducer, and fp16 grad scaling gets double-updated).
-- **Block swap (`--blocks_to_swap > 0`) is implemented but untested**: `call_dit` resets block
-  placement to its canonical layout before every forward (see the docstring there) to work around
-  `ModelOffloader`'s single forward/backward-per-step assumption, which this trainer's multiple
-  forwards per step (student rollout, fake-score, teacher, updated fake-score) violate. No test
-  exercises `blocks_to_swap > 0` in this extension.
+- **Block swap (`--blocks_to_swap > 0`) needs `--block_swap_h2d_only`, or every `call_dit` call
+  pays a full weight round-trip**: `call_dit` resets block placement to its canonical layout before
+  every forward (see the docstring there) to work around `ModelOffloader`'s single
+  forward/backward-per-step assumption, which this trainer's multiple forwards per step (student
+  rollout, fake-score, teacher, updated fake-score, and the diversity term's own rollout(s)) violate.
+  Confirmed on real hardware (16GB card, `--blocks_to_swap 26`): with the classic `ModelOffloader`
+  path (`--blocks_to_swap` alone, no `--block_swap_h2d_only`), each reset moves nearly the whole
+  quantized model's weights to the GPU and mostly back — `prepare_block_devices_before_forward`'s
+  swapped-block loop does `b.to(device)` (moving the *entire* block, weights included) purely to
+  place its non-weight buffers, then immediately moves the weights back to CPU via
+  `weighs_to_device`, round-tripping the weights on every call. Measured per-call reset cost with
+  this trainer's `--tdm_diversity_memory_efficient` path (many `call_dit` calls per step): 130ms to
+  over 100,000ms per reset, wildly variable call to call. Switching to `--block_swap_h2d_only
+  --block_swap_ring_size 2 --use_pinned_memory_for_block_swap` (requires `--gradient_checkpointing`)
+  routes through `LoRAStreamOffloader` instead, whose reset is a one-time setup on the first call and
+  a cheap reference-rebind (no tensor copy) on every call after — measured at a consistent 130-190ms
+  per call in the same run, and the training step time dropped from well over a minute per step to
+  ~7s/step. **Always pass `--block_swap_h2d_only` (with `--block_swap_ring_size` and
+  `--use_pinned_memory_for_block_swap`) alongside `--blocks_to_swap` for this trainer** — the classic
+  path is not just slower, it is unusably slow given how many forwards this trainer runs per step.
+  Two temporary env-gated debug aids exist for investigating this further: `TDM_DISTILL_DEBUG_BLOCK_RESET=1`
+  (this repo's `call_dit`, per-call reset timing) and `TDM_DISTILL_DEBUG_RESET_PHASES=1` (musubi-tuner's
+  `custom_offloading_utils.py`, breaks `prepare_block_devices_before_forward` into its four phases —
+  resident-to-device, swapped-to-cpu, synchronize, clean_memory).
 - **Teacher CFG requires `--text_encoder` and `--sample_prompts`**: when `--tdm_guidance_scale >
   1.0`, `process_sample_prompts` builds a cached unconditional (empty-prompt) embedding in the same
   text-encoder session it uses for sample-prompt caching, before the DiT loads. This is deliberate:
@@ -142,10 +161,15 @@ the student learns — it is not a passive/logging-only metric computed on the s
 - **`--tdm_guidance_scale > 1.0` together with `--tdm_diversity_weight > 0` needs more VRAM than
   either alone**: confirmed on a 16GB card (ConvRot INT8, `--blocks_to_swap 26`) that CFG's extra
   teacher forward and the diversity term's grad-enabled rollout each work fine on their own, but
-  together they can OOM mid-step during `accelerator.backward()`. Use
-  `--tdm_diversity_memory_efficient` (two-pass per-sample gradient accumulation, same math, lower
-  peak VRAM, slower per step) and a low `--tdm_diversity_step_count` (default `1`) to fit both
-  together on constrained cards.
+  together they can OOM mid-step during `accelerator.backward()` on the plain (non-memory-efficient)
+  diversity path. **Confirmed fixed on the same card**: `--tdm_diversity_memory_efficient` (two-pass
+  per-sample gradient accumulation, same math, lower peak VRAM, slower per step) combined with a low
+  `--tdm_diversity_step_count` (default `1`) completes CFG + diversity together without OOM —
+  `--tdm_guidance_scale 3.0 --tdm_diversity_weight 0.1 --tdm_diversity_group_size 2
+  --tdm_diversity_memory_efficient --tdm_diversity_step_count 1 --blocks_to_swap 26
+  --block_swap_h2d_only --block_swap_ring_size 2 --use_pinned_memory_for_block_swap` ran 5/5 steps,
+  checkpoints saved, no OOM. `--block_swap_h2d_only` (see the block-swap bullet above) was necessary
+  to make this combination run in reasonable wall-clock time, not just to avoid OOM.
 - **Experimental**: no correctness guarantee against the TDM paper's own results; K2 is not an
   architecture the paper evaluates.
 - **DINOv3 gate**: `facebook/dinov3-vitb16-pretrain-lvd1689m` requires one-time Hugging Face license
