@@ -57,6 +57,7 @@ if needed.
 | `--tdm_diversity_group_size` | 4 | Same-prompt samples per training step for the diversity term |
 | `--tdm_diversity_step_count` | 1 | Euler step count for the diversity term's own rollout, independent of `--tdm_step_counts` |
 | `--tdm_diversity_weight` | 0.1 | Constant weight on the diversity loss (not annealed — see below) |
+| `--tdm_diversity_memory_efficient` | off | Two-pass per-sample diversity gradient accumulation; same math, lower peak VRAM, slower |
 | `--tdm_guidance_scale` | required, no default | CFG scale for the teacher's real-score forward (`uncond + scale*(cond-uncond)`); `<= 1.0` disables CFG |
 | `--fake_score_learning_rate` | 10x `--learning_rate` | Fake-score critic's own optimizer LR |
 | `--fake_score_optimizer_type` | mirrors `--optimizer_type` | Fake-score critic's optimizer |
@@ -141,9 +142,10 @@ the student learns — it is not a passive/logging-only metric computed on the s
 - **`--tdm_guidance_scale > 1.0` together with `--tdm_diversity_weight > 0` needs more VRAM than
   either alone**: confirmed on a 16GB card (ConvRot INT8, `--blocks_to_swap 26`) that CFG's extra
   teacher forward and the diversity term's grad-enabled rollout each work fine on their own, but
-  together they OOM mid-step during `accelerator.backward()`. This is a real combined-cost ceiling,
-  not a code bug. If you hit this, reduce `--tdm_diversity_group_size` (2 is the practical minimum),
-  cap `--tdm_step_counts` at a single small value, or use a card with more headroom.
+  together they can OOM mid-step during `accelerator.backward()`. Use
+  `--tdm_diversity_memory_efficient` (two-pass per-sample gradient accumulation, same math, lower
+  peak VRAM, slower per step) and a low `--tdm_diversity_step_count` (default `1`) to fit both
+  together on constrained cards.
 - **Experimental**: no correctness guarantee against the TDM paper's own results; K2 is not an
   architecture the paper evaluates.
 - **DINOv3 gate**: `facebook/dinov3-vitb16-pretrain-lvd1689m` requires one-time Hugging Face license

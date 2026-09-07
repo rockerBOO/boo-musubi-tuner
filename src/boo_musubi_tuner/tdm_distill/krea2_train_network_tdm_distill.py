@@ -457,6 +457,85 @@ class Krea2TdmDistillNetworkTrainer(Krea2NetworkTrainer):
         div_loss = diversity_loss_from_embeddings(embeddings)
         return div_loss, False
 
+    def _diversity_loss_memory_efficient(
+        self, args, accelerator, transformer, single_prompt_batch, vae, device, dit_dtype, network_dtype
+    ) -> "tuple[torch.Tensor, bool]":
+        """Same diversity loss as _diversity_loss_full, computed via two passes so peak VRAM is
+        bounded to one sample's rollout graph instead of group_size of them. Pass 1 (no_grad, whole
+        group batched) gets the embeddings needed to compute the real pairwise loss and its gradient
+        w.r.t. each embedding. Pass 2 (grad, one sample at a time) reuses pass 1's exact noise draw
+        per sample (via _student_rollout's noise parameter) to re-derive each sample's embedding
+        differentiably and backprops the cached upstream gradient into just that sample's rollout,
+        freeing the graph before moving to the next sample. Mathematically identical gradient to the
+        full batched path -- not an approximation -- because the pairwise loss's gradient w.r.t.
+        embedding_i only depends on the (here, detached) values of the other embeddings, not their
+        graphs, and pass 2 reproduces pass 1's trajectory exactly (same noise, same weights, no
+        dropout)."""
+        group_size = args.tdm_diversity_group_size
+        model = accelerator.unwrap_model(transformer)
+        lat_h = single_prompt_batch["latents"].shape[-2]
+        lat_w = single_prompt_batch["latents"].shape[-1]
+        noise_batch = torch.randn(group_size, model.config.channels, 1, lat_h, lat_w, device=device, dtype=dit_dtype)
+
+        if not self._vae_frozen and hasattr(vae, "parameters"):
+            for p in vae.parameters():
+                p.requires_grad_(False)
+            self._vae_frozen = True
+
+        # Pass 1: cheap, no graph retained.
+        with torch.no_grad():
+            group_trajectory, _ = self._student_rollout(
+                args,
+                accelerator,
+                transformer,
+                single_prompt_batch,
+                args.tdm_diversity_step_count,
+                grad_from_step=args.tdm_diversity_step_count,
+                device=device,
+                dit_dtype=dit_dtype,
+                network_dtype=network_dtype,
+                noise=noise_batch,
+            )
+            vae.to(device)
+            pixels = vae.decode_to_pixels(group_trajectory[-1].to(vae.dtype))
+            pixel_batch = torch.clamp(pixels.float(), 0.0, 1.0)
+            embeddings_nograd = self._dinov3_embedder.embed_differentiable(pixel_batch)
+
+        self._vae_ref = vae
+        self._vae_needs_cpu_return = True
+
+        # Get d(loss)/d(embedding_i) for each i, cheaply (just the embeddings, no rollout graph).
+        embeddings_leaf = embeddings_nograd.detach().clone().requires_grad_(True)
+        div_loss = args.tdm_diversity_weight * diversity_loss_from_embeddings(embeddings_leaf)
+        accelerator.backward(div_loss)
+        upstream_grad = embeddings_leaf.grad  # (group_size, D)
+
+        # Pass 2: one sample at a time, grad-enabled, reusing pass 1's noise slice for that sample.
+        for i in range(group_size):
+            sample_batch = {
+                "krea2_vl_embed": [single_prompt_batch["krea2_vl_embed"][i]],
+                "latents": single_prompt_batch["latents"][i : i + 1],
+            }
+            sample_trajectory, _ = self._student_rollout(
+                args,
+                accelerator,
+                transformer,
+                sample_batch,
+                args.tdm_diversity_step_count,
+                grad_from_step=0,
+                device=device,
+                dit_dtype=dit_dtype,
+                network_dtype=network_dtype,
+                noise=noise_batch[i : i + 1],
+            )
+            vae.to(device)
+            sample_pixels = vae.decode_to_pixels(sample_trajectory[-1].to(vae.dtype))
+            sample_pixel_batch = torch.clamp(sample_pixels.float(), 0.0, 1.0)
+            sample_embedding = self._dinov3_embedder.embed_differentiable(sample_pixel_batch)
+            accelerator.backward(sample_embedding, gradient=upstream_grad[i : i + 1])
+
+        return div_loss.detach() / args.tdm_diversity_weight, True
+
     def process_batch(
         self,
         args: argparse.Namespace,
@@ -617,7 +696,10 @@ class Krea2TdmDistillNetworkTrainer(Krea2NetworkTrainer):
             # backward's recompute needs the block-swap ring in exactly the state its own forward
             # left it in; any later forward pass (this rollout, if it ran after) repositions blocks
             # for its own purposes and desyncs that ring before backward gets to it.
-            div_loss, div_already_backpropped = self._diversity_loss_full(
+            diversity_fn = (
+                self._diversity_loss_memory_efficient if args.tdm_diversity_memory_efficient else self._diversity_loss_full
+            )
+            div_loss, div_already_backpropped = diversity_fn(
                 args, accelerator, transformer, single_prompt_batch, vae, device, dit_dtype, network_dtype
             )
 
@@ -686,6 +768,14 @@ def tdm_distill_setup_parser(parser: argparse.ArgumentParser) -> argparse.Argume
         "sample to compare, not a faithful few-step-distillation demonstration) and keeps diversity's "
         "VRAM cost constant across iterations instead of riding on whichever K gets sampled for the "
         "main objective.",
+    )
+    parser.add_argument(
+        "--tdm_diversity_memory_efficient",
+        action="store_true",
+        help="Compute the diversity term via a two-pass, per-sample gradient accumulation instead of "
+        "one batched rollout over the whole group. Produces the mathematically identical gradient at "
+        "the cost of an extra cheap no-grad pass, but bounds peak VRAM to roughly one sample's "
+        "rollout instead of --tdm_diversity_group_size of them. Slower; use when VRAM-constrained.",
     )
     parser.add_argument(
         "--tdm_diversity_weight",
