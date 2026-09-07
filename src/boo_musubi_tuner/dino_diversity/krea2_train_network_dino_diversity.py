@@ -179,6 +179,20 @@ class Krea2DinoDiversityNetworkTrainer(Krea2NetworkTrainer):
             self._vae_ref = None
             self._vae_needs_cpu_return = False
 
+    def extra_metadata(self, args: argparse.Namespace) -> dict:
+        metadata = dict(super().extra_metadata(args))
+        if not args.dino_diversity:
+            return metadata
+        metadata.update(
+            {
+                "ss_dino_diversity": True,
+                "ss_dino_diversity_lora_init": args.dino_diversity_lora_init,
+                "ss_dino_diversity_group_size": args.dino_diversity_group_size,
+                "ss_dino_diversity_step_count": args.dino_diversity_step_count,
+            }
+        )
+        return metadata
+
     def call_dit(
         self,
         args: argparse.Namespace,

@@ -10,6 +10,7 @@ Repo: [github.com/rockerBOO/boo-musubi-tuner](https://github.com/rockerBOO/boo-m
 - [Explorative Modeling](docs/explorative-modeling.md) — best-of-K candidate training for FLUX.2 and Krea 2
 - [Wavelet Loss](docs/wavelet-loss.md) — frequency-domain auxiliary loss for FLUX.2
 - [TDM Diversity Distillation](docs/tdm-distill.md) — experimental K2 guidance+step distillation (TDM) with a DINOv3 diversity term folded into the student loss
+- [DINOv3 Standalone Diversity Fine-Tuning](docs/dino_diversity.md) — experimental K2 diversity-only fine-tuning, decoupled from TDM
 
 ## Setup
 
