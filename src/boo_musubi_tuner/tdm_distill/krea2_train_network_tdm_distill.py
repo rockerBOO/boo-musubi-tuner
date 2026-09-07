@@ -40,6 +40,8 @@ class Krea2TdmDistillNetworkTrainer(Krea2NetworkTrainer):
         super().__init__()
         self._role_switcher: LoraRoleSwitcher | None = None
         self._fake_score_optimizer = None
+        self._fake_score_optimizer_train_fn = lambda: None
+        self._fake_score_optimizer_eval_fn = lambda: None
         self._dinov3_embedder = None
         # Set when process_batch moved the VAE onto the training device for a grad-enabled
         # decode; consumed by on_post_optimizer_step (see the comment in process_batch).
@@ -118,10 +120,29 @@ class Krea2TdmDistillNetworkTrainer(Krea2NetworkTrainer):
         fake_score_args = argparse.Namespace(**vars(args))
         fake_score_args.learning_rate = args.fake_score_learning_rate
         fake_score_args.optimizer_type = args.fake_score_optimizer_type
-        _, _, self._fake_score_optimizer, _, _ = self.get_optimizer(fake_score_args, list(unwrapped_nw.parameters()))
+        _, _, self._fake_score_optimizer, self._fake_score_optimizer_train_fn, self._fake_score_optimizer_eval_fn = (
+            self.get_optimizer(fake_score_args, list(unwrapped_nw.parameters()))
+        )
         self._fake_score_optimizer = accelerator.prepare(self._fake_score_optimizer)
+        # Mirrors trainer_base.py's own `optimizer_train_fn()` call right before its training loop
+        # starts (see the "Set training mode" call site): for plain optimizers get_optimizer()
+        # returns a no-op here, but for schedule-free optimizers (e.g. AdamWScheduleFree, which
+        # construct in eval mode) this is required before the critic's first .step() call, or it
+        # would silently train under eval-mode statistics.
+        self._fake_score_optimizer_train_fn()
 
         self._dinov3_embedder = None
+
+        if args.tdm_diversity_weight > 0.0:
+            budget = max(args.tdm_step_counts) * args.tdm_diversity_group_size
+            if budget > 16:
+                logger.warning(
+                    f"TDM diversity term: max(--tdm_step_counts)={max(args.tdm_step_counts)} * "
+                    f"--tdm_diversity_group_size={args.tdm_diversity_group_size} = {budget} simultaneous "
+                    "sample-forwards with retained activations for the diversity rollout. This is the "
+                    "single largest activation consumer in the step and sets peak VRAM; consider lowering "
+                    "one of these flags if you hit OOM. (Heuristic threshold, not a hard limit.)"
+                )
 
         if args.tdm_guidance_scale > 1.0:
             encoder = krea2_utils.load_krea2_text_encoder(args.text_encoder, dtype=torch.bfloat16, device=accelerator.device)
@@ -159,6 +180,28 @@ class Krea2TdmDistillNetworkTrainer(Krea2NetworkTrainer):
             self._vae_ref = None
             self._vae_needs_cpu_return = False
 
+    def on_before_sample_images(
+        self, accelerator, args, epoch, steps, vae, transformer, network, sample_parameters, dit_dtype
+    ) -> None:
+        super().on_before_sample_images(accelerator, args, epoch, steps, vae, transformer, network, sample_parameters, dit_dtype)
+        if not args.tdm_distill:
+            return
+        # Mirrors trainer_base.py's own optimizer_eval_fn() call immediately before it invokes
+        # _do_sample() (which calls this hook, then sample_images(), then on_after_sample_images):
+        # a schedule-free fake-score optimizer must be in eval mode for inference, same as the
+        # main optimizer.
+        self._fake_score_optimizer_eval_fn()
+
+    def on_after_sample_images(
+        self, accelerator, args, epoch, steps, vae, transformer, network, sample_parameters, dit_dtype
+    ) -> None:
+        super().on_after_sample_images(accelerator, args, epoch, steps, vae, transformer, network, sample_parameters, dit_dtype)
+        if not args.tdm_distill:
+            return
+        # Mirrors trainer_base.py's own optimizer_train_fn() call right after _do_sample()
+        # returns, restoring train mode for the next optimizer.step() call.
+        self._fake_score_optimizer_train_fn()
+
     def extra_metadata(self, args: argparse.Namespace) -> dict:
         metadata = dict(super().extra_metadata(args))
         if not args.tdm_distill:
@@ -169,6 +212,9 @@ class Krea2TdmDistillNetworkTrainer(Krea2NetworkTrainer):
                 "ss_tdm_step_counts": args.tdm_step_counts,
                 "ss_tdm_diversity_weight": args.tdm_diversity_weight,
                 "ss_tdm_diversity_group_size": args.tdm_diversity_group_size,
+                "ss_tdm_guidance_scale": args.tdm_guidance_scale,
+                "ss_fake_score_learning_rate": args.fake_score_learning_rate,
+                "ss_fake_score_optimizer_type": args.fake_score_optimizer_type,
             }
         )
         return metadata
@@ -280,8 +326,9 @@ class Krea2TdmDistillNetworkTrainer(Krea2NetworkTrainer):
         global_step: int,
     ) -> "tuple[torch.Tensor, dict[str, float]]":
         """TDM step replacing vanilla flow matching. Data-free: `latents`/`noise` args are
-        ignored — only batch["krea2_vl_embed"] (the prompt) is used, per the design doc's
-        data-free TDM decision. Returns L_tdm only; Task 8 adds the diversity term on top."""
+        ignored — only batch["krea2_vl_embed"] (the prompt) is used. Returns the TDM student
+        loss, plus the DINOv3 group-diversity term added on top when
+        --tdm_diversity_weight > 0."""
         if not args.tdm_distill:
             return super().process_batch(
                 args,
@@ -317,80 +364,95 @@ class Krea2TdmDistillNetworkTrainer(Krea2NetworkTrainer):
         num_steps = sample_step_count(args.tdm_step_counts, generator=None)
         interval = sample_trajectory_interval(num_steps, generator=None)
 
-        # 1. build the trajectory up to (and including) x_ti under the student role. The whole
-        #    rollout runs under no_grad (grad_from_step=num_steps): the grad-carrying copy of the
-        #    final incremental step is recomputed in step 5, *after* all role swaps are done.
-        #    Building it here instead would leave a live graph over the LoRA weights across the
-        #    fake-score/teacher swaps, and LoraRoleSwitcher's load_state_dict bumps those params'
-        #    version counters — the outer loop's deferred backward() would then raise
-        #    "variable needed for gradient computation has been modified by an inplace operation".
-        switcher.use_student()
-        trajectory, ts = self._student_rollout(
-            args,
-            accelerator,
-            transformer,
-            batch,
-            num_steps,
-            grad_from_step=num_steps,
-            device=device,
-            dit_dtype=dit_dtype,
-            network_dtype=network_dtype,
-        )
-        x_i, x_ti = trajectory[interval], trajectory[interval + 1]
-        t_i, t_i_plus_1 = ts[interval], ts[interval + 1]
+        # Steps 1-4 switch the shared LoRA network between student/fake-score/teacher roles.
+        # The whole sequence runs inside try/finally so that switcher.use_student() in the
+        # finally block always runs -- on normal completion *and* on any exception raised partway
+        # through a role switch -- restoring the canonical "student" resting state that the next
+        # call to process_batch (and on_post_save, if training stops here) expects. This finally
+        # is also what step 5 used to do as a standalone inline call; folding it in here means
+        # the invariant is structural rather than incidental.
+        try:
+            # 1. build the trajectory up to (and including) x_ti under the student role. The whole
+            #    rollout runs under no_grad (grad_from_step=num_steps): the grad-carrying copy of
+            #    the final incremental step is recomputed in step 6, *after* all role swaps are
+            #    done. Building it here instead would leave a live graph over the LoRA weights
+            #    across the fake-score/teacher swaps, and LoraRoleSwitcher's load_state_dict bumps
+            #    those params' version counters — the outer loop's deferred backward() would then
+            #    raise "variable needed for gradient computation has been modified by an inplace
+            #    operation".
+            switcher.use_student()
+            trajectory, ts = self._student_rollout(
+                args,
+                accelerator,
+                transformer,
+                batch,
+                num_steps,
+                grad_from_step=num_steps,
+                device=device,
+                dit_dtype=dit_dtype,
+                network_dtype=network_dtype,
+            )
+            x_i, x_ti = trajectory[interval], trajectory[interval + 1]
+            t_i, t_i_plus_1 = ts[interval], ts[interval + 1]
 
-        # 2. diffuse x_ti with fresh noise to get x_tau, roughly halfway into the interval.
-        tau = (t_i + t_i_plus_1) / 2.0
-        fresh_noise = torch.randn_like(x_ti.detach())
-        x_tau = (1 - tau) * x_ti.detach() + tau * fresh_noise
-        timesteps_tau = torch.full((x_ti.shape[0],), tau * 1000.0, device=device, dtype=torch.float32)
+            # 2. diffuse x_ti with fresh noise to get x_tau, roughly halfway into the interval.
+            tau = (t_i + t_i_plus_1) / 2.0
+            fresh_noise = torch.randn_like(x_ti.detach())
+            x_tau = (1 - tau) * x_ti.detach() + tau * fresh_noise
+            timesteps_tau = torch.full((x_ti.shape[0],), tau * 1000.0, device=device, dtype=torch.float32)
 
-        # 3. fake-score update: predict at x_tau, denoise toward x_ti, step its own optimizer.
-        switcher.use_fake_score()
-        fake_score_pred = self.call_dit(
-            args, accelerator, transformer, x_tau, batch, fresh_noise, x_tau, timesteps_tau, network_dtype
-        ).pred
-        fake_score_target = (fresh_noise - x_ti.detach()).detach()
-        fake_score_loss = fake_score_denoising_loss(fake_score_pred, fake_score_target, omega_tau=min_snr_weight(tau))
-        accelerator.backward(fake_score_loss)
-        self._fake_score_optimizer.step()
-        self._fake_score_optimizer.zero_grad(set_to_none=True)
-
-        # 4. real score (teacher, frozen) and fake score (just-updated) at x_tau -> revised target.
-        switcher.use_teacher()
-        with torch.no_grad():
-            cond_score = self.call_dit(
+            # 3. fake-score update: predict at x_tau, denoise toward x_ti, step its own optimizer.
+            switcher.use_fake_score()
+            fake_score_pred = self.call_dit(
                 args, accelerator, transformer, x_tau, batch, fresh_noise, x_tau, timesteps_tau, network_dtype
             ).pred
-            if args.tdm_guidance_scale > 1.0:
-                bsize = x_tau.shape[0]
-                uncond_batch = dict(batch)
-                uncond_batch["krea2_vl_embed"] = [self._teacher_uncond_embed] * bsize
-                uncond_score = self.call_dit(
-                    args, accelerator, transformer, x_tau, uncond_batch, fresh_noise, x_tau, timesteps_tau, network_dtype
+            fake_score_target = (fresh_noise - x_ti.detach()).detach()
+            omega_tau = min_snr_weight(tau)
+            fake_score_loss = fake_score_denoising_loss(fake_score_pred, fake_score_target, omega_tau=omega_tau)
+            accelerator.backward(fake_score_loss)
+            self._fake_score_optimizer.step()
+            self._fake_score_optimizer.zero_grad(set_to_none=True)
+
+            # 4. real score (teacher, frozen) and fake score (just-updated) at x_tau -> revised target.
+            switcher.use_teacher()
+            with torch.no_grad():
+                cond_score = self.call_dit(
+                    args, accelerator, transformer, x_tau, batch, fresh_noise, x_tau, timesteps_tau, network_dtype
                 ).pred
-                real_score = cfg_combine(cond_score, uncond_score, args.tdm_guidance_scale)
-            else:
-                real_score = cond_score
-        switcher.use_fake_score()
-        with torch.no_grad():
-            fake_score_updated = self.call_dit(
-                args, accelerator, transformer, x_tau, batch, fresh_noise, x_tau, timesteps_tau, network_dtype
-            ).pred
-        # Negative on purpose: krea2_sampling.timesteps runs 1 -> 0, so t_i_plus_1 < t_i. That sign is
-        # what reconciles velocity-space predictions with the score-space convention TDM's revised
-        # target is written in. Do not "fix" it to abs() or a swapped subtraction.
-        lambda_tau = t_i_plus_1 - t_i
-        x_revised = revised_sample(x_ti.detach(), real_score, fake_score_updated, lambda_tau).detach()
-
-        # 5. student role goes live now, once, and stays live through both the diversity term's
-        #    rollout (if enabled) and the student loss forward below. LoraRoleSwitcher.use_student()
-        #    calls load_state_dict on the live LoRA weights, which bumps their version counters --
-        #    calling it again after a graph has been built over those weights would make the outer
-        #    loop's deferred backward() raise "variable needed for gradient computation has been
-        #    modified by an inplace operation". So it must run exactly once here, before anything
-        #    that needs student weights with grad.
-        switcher.use_student()
+                if args.tdm_guidance_scale > 1.0:
+                    bsize = x_tau.shape[0]
+                    uncond_batch = dict(batch)
+                    uncond_batch["krea2_vl_embed"] = [self._teacher_uncond_embed] * bsize
+                    uncond_score = self.call_dit(
+                        args, accelerator, transformer, x_tau, uncond_batch, fresh_noise, x_tau, timesteps_tau, network_dtype
+                    ).pred
+                    real_score = cfg_combine(cond_score, uncond_score, args.tdm_guidance_scale)
+                else:
+                    real_score = cond_score
+            switcher.use_fake_score()
+            with torch.no_grad():
+                fake_score_updated = self.call_dit(
+                    args, accelerator, transformer, x_tau, batch, fresh_noise, x_tau, timesteps_tau, network_dtype
+                ).pred
+            # Negative on purpose: krea2_sampling.timesteps runs 1 -> 0, so t_i_plus_1 < t_i. That
+            # sign is what reconciles velocity-space predictions with the score-space convention
+            # TDM's revised target is written in. Do not "fix" it to abs() or a swapped
+            # subtraction. Magnitude: lambda_tau is deliberately the raw (signed) interval width
+            # t_i_plus_1 - t_i, not a separately-tunable step size -- it is the one-step Euler
+            # discrepancy between the real and fake flows integrated over exactly this interval,
+            # matching how x_ti_student itself is advanced in step 6 below.
+            lambda_tau = t_i_plus_1 - t_i
+            x_revised = revised_sample(x_ti.detach(), real_score, fake_score_updated, lambda_tau).detach()
+        finally:
+            # 5. student role goes live now, once, and stays live through both the diversity
+            #    term's rollout (if enabled) and the student loss forward below.
+            #    LoraRoleSwitcher.use_student() calls load_state_dict on the live LoRA weights,
+            #    which bumps their version counters -- calling it again after a graph has been
+            #    built over those weights would make the outer loop's deferred backward() raise
+            #    "variable needed for gradient computation has been modified by an inplace
+            #    operation". So nothing below this point may call use_student() (or any other role
+            #    switch) again.
+            switcher.use_student()
 
         div_loss = None
         if args.tdm_diversity_weight > 0.0 and vae is not None:
@@ -402,8 +464,9 @@ class Krea2TdmDistillNetworkTrainer(Krea2NetworkTrainer):
             # This whole chain (rollout -> VAE decode -> DINOv3 embed -> diversity loss) must stay
             # differentiable: the diversity term is a real training signal, so gradient has to reach
             # the student LoRA weights. Hence grad_from_step=0 (every rollout step grad-enabled), no
-            # torch.no_grad() around the decode, and embed_differentiable instead of embed() (which
-            # is @torch.no_grad() and takes numpy images — both graph-severing). The VAE's own
+            # torch.no_grad() around the decode, and Dinov3ImageEmbedder.embed_differentiable
+            # (which runs without @torch.no_grad() and takes an already-decoded tensor, not
+            # PIL/numpy images, so it stays graph-preserving end to end). The VAE's own
             # params are frozen and in no optimizer, but the decode *operation* still has to run
             # with grad so pixels carry a graph back to final_latent.
             #
@@ -425,10 +488,12 @@ class Krea2TdmDistillNetworkTrainer(Krea2NetworkTrainer):
                 network_dtype=network_dtype,
             )
             final_latent = group_trajectory[-1]
-            # The VAE's own params are never trained and belong to no optimizer, but this decode
-            # runs with grad enabled, so without freezing them every backward() would accumulate
-            # (and permanently hold) a .grad buffer on each one. Freeze once, lazily: on_train_start
-            # is not handed the vae, so first use here is the earliest hook that has it.
+            # Defensive/redundant: trainer_base.py already does vae.requires_grad_(False) once at
+            # load time, so this re-freeze is not the thing preventing .grad accumulation in the
+            # common case. It is kept because this code cannot rely on that having already run for
+            # every possible vae object reaching this point, and requires_grad_(False) is cheap
+            # and idempotent to repeat. Freeze once, lazily: on_train_start is not handed the vae,
+            # so first use here is the earliest hook that has it.
             if not self._vae_frozen and hasattr(vae, "parameters"):
                 for p in vae.parameters():
                     p.requires_grad_(False)
@@ -468,6 +533,8 @@ class Krea2TdmDistillNetworkTrainer(Krea2NetworkTrainer):
             "loss/fake_score": fake_score_loss.detach().item(),
             "tdm/k": float(num_steps),
             "tdm/interval": float(interval),
+            "tdm/tau": float(tau),
+            "tdm/omega_tau": float(omega_tau),
         }
 
         if div_loss is not None:

@@ -77,3 +77,20 @@ class StubLoraNetwork(torch.nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return x + self.multiplier * self.lora_w
+
+
+class FakeScheduleFreeOptimizer(torch.optim.SGD):
+    """Minimal stand-in for a schedule-free optimizer (e.g. AdamWScheduleFree from the
+    `schedulefree` package): exposes .train()/.eval() the way trainer_base.py's get_optimizer()
+    detects (`hasattr(optimizer, "train") and callable(optimizer.train)`), and records every call
+    so tests can assert on the exact train/eval call sequence."""
+
+    def __init__(self, params, lr=0.01, **kwargs):
+        super().__init__(params, lr=lr)
+        self.mode_log: list[str] = []
+
+    def train(self, mode: bool = True) -> None:
+        self.mode_log.append("train" if mode else "eval")
+
+    def eval(self) -> None:
+        self.mode_log.append("eval")
