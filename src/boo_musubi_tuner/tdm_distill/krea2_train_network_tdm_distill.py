@@ -437,17 +437,26 @@ class Krea2TdmDistillNetworkTrainer(Krea2NetworkTrainer):
             transformer,
             single_prompt_batch,
             args.tdm_diversity_step_count,
+            # grad_from_step=0: unlike the main student rollout, every step here needs a live
+            # graph -- the whole point of this rollout is to backprop the diversity loss into the
+            # student LoRA weights through the entire trajectory, not just a single final step.
             grad_from_step=0,
             device=device,
             dit_dtype=dit_dtype,
             network_dtype=network_dtype,
         )
         final_latent = group_trajectory[-1]
+        # Defensive: the VAE should already be frozen by the base trainer, but only do this once
+        # per run (not once per call) since requires_grad_ on every param is not free.
         if not self._vae_frozen and hasattr(vae, "parameters"):
             for p in vae.parameters():
                 p.requires_grad_(False)
             self._vae_frozen = True
 
+        # Move to the training device now, but do not move it back to CPU until the graph built
+        # over this decode has been backpropped (see on_post_optimizer_step): nn.Module.to()
+        # rebinds each param's storage, and autograd may hold saved references to the old storage
+        # for backward's recompute -- moving early would desync those references mid-backward.
         vae.to(device)
         pixels = vae.decode_to_pixels(final_latent.to(vae.dtype))
         self._vae_ref = vae
@@ -496,6 +505,9 @@ class Krea2TdmDistillNetworkTrainer(Krea2NetworkTrainer):
                 network_dtype=network_dtype,
                 noise=noise_batch,
             )
+            # See _diversity_loss_full's comment on vae.to(device)/on_post_optimizer_step for why
+            # the VAE isn't returned to CPU immediately, even though this particular decode is
+            # no_grad -- pass 2 below reuses the same VAE instance under a live graph.
             vae.to(device)
             pixels = vae.decode_to_pixels(group_trajectory[-1].to(vae.dtype))
             pixel_batch = torch.clamp(pixels.float(), 0.0, 1.0)
@@ -505,10 +517,14 @@ class Krea2TdmDistillNetworkTrainer(Krea2NetworkTrainer):
         self._vae_needs_cpu_return = True
 
         # Get d(loss)/d(embedding_i) for each i, cheaply (just the embeddings, no rollout graph).
+        # This is a local Jacobian query, not a real training backward, so it must not go through
+        # accelerator.backward (which applies gradient-accumulation and GradScaler scaling) --
+        # doing so would double-apply that scaling once here and once more in the per-sample
+        # backward below.
         embeddings_leaf = embeddings_nograd.detach().clone().requires_grad_(True)
-        div_loss = args.tdm_diversity_weight * diversity_loss_from_embeddings(embeddings_leaf)
-        accelerator.backward(div_loss)
-        upstream_grad = embeddings_leaf.grad  # (group_size, D)
+        unweighted_div_loss = diversity_loss_from_embeddings(embeddings_leaf)
+        div_loss = args.tdm_diversity_weight * unweighted_div_loss
+        upstream_grad = torch.autograd.grad(div_loss, embeddings_leaf)[0]  # (group_size, D)
 
         # Pass 2: one sample at a time, grad-enabled, reusing pass 1's noise slice for that sample.
         for i in range(group_size):
@@ -534,7 +550,7 @@ class Krea2TdmDistillNetworkTrainer(Krea2NetworkTrainer):
             sample_embedding = self._dinov3_embedder.embed_differentiable(sample_pixel_batch)
             accelerator.backward(sample_embedding, gradient=upstream_grad[i : i + 1])
 
-        return div_loss.detach() / args.tdm_diversity_weight, True
+        return unweighted_div_loss.detach(), True
 
     def process_batch(
         self,

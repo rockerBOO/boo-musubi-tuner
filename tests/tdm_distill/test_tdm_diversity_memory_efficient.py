@@ -36,11 +36,15 @@ def _run(tiny_k2_config, seed, memory_efficient, **arg_overrides):
 
 
 def test_memory_efficient_path_matches_full_path_gradient(tiny_k2_config):
-    loss_full, metrics_full, net_full = _run(tiny_k2_config, seed=11, memory_efficient=False)
+    # tdm_diversity_weight is set far above the default (0.1) so the diversity term's contribution
+    # to the gradient dominates the comparison -- at the default weight the diversity term's
+    # contribution is smaller than the tolerances below, so the assertion would pass even if the
+    # two paths' diversity gradients disagreed completely.
+    loss_full, metrics_full, net_full = _run(tiny_k2_config, seed=11, memory_efficient=False, tdm_diversity_weight=1000)
     loss_full.backward()
     grad_full = net_full.lora_w.grad.clone()
 
-    loss_eff, metrics_eff, net_eff = _run(tiny_k2_config, seed=11, memory_efficient=True)
+    loss_eff, metrics_eff, net_eff = _run(tiny_k2_config, seed=11, memory_efficient=True, tdm_diversity_weight=1000)
     # loss_eff already carries the diversity contribution's backward from inside process_batch;
     # backward() on the returned loss adds only the main TDM student loss's contribution, same
     # as the full path's second backward would.
@@ -118,6 +122,9 @@ def test_memory_efficient_path_backward_call_count(tiny_k2_config):
     )
     handle.remove()
 
-    # fake-score loss (step 3, gradient=None) + diversity pass-1 loss (gradient=None) +
-    # 3 diversity pass-2 per-sample backprops (gradient=upstream_grad slice, not None).
-    assert backward_calls == [False, False, True, True, True]
+    # fake-score loss (step 3, gradient=None) + 3 diversity pass-2 per-sample backprops
+    # (gradient=upstream_grad slice, not None). The diversity pass-1 leaf-tensor Jacobian query
+    # uses torch.autograd.grad directly (not accelerator.backward), so it doesn't show up here --
+    # going through accelerator.backward there would double-apply gradient-accumulation/GradScaler
+    # scaling.
+    assert backward_calls == [False, True, True, True]
