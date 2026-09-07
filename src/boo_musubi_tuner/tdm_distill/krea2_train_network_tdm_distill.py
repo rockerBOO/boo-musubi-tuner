@@ -71,6 +71,11 @@ class Krea2TdmDistillNetworkTrainer(Krea2NetworkTrainer):
                 f"--tdm_diversity_group_size ({args.tdm_diversity_group_size}) must be >= 2 "
                 "(pairwise diversity is undefined for fewer than 2 samples)."
             )
+        if not (1 <= args.tdm_diversity_step_count <= max(args.tdm_step_counts)):
+            raise ValueError(
+                f"--tdm_diversity_step_count ({args.tdm_diversity_step_count}) must be between 1 and "
+                f"max(--tdm_step_counts) ({max(args.tdm_step_counts)}), inclusive."
+            )
         if args.tdm_guidance_scale is None:
             raise ValueError("--tdm_guidance_scale is required when --tdm_distill is set.")
         if args.tdm_guidance_scale > 1.0 and not args.text_encoder:
@@ -242,10 +247,10 @@ class Krea2TdmDistillNetworkTrainer(Krea2NetworkTrainer):
         self._dinov3_embedder = None
 
         if args.tdm_diversity_weight > 0.0:
-            budget = max(args.tdm_step_counts) * args.tdm_diversity_group_size
+            budget = args.tdm_diversity_step_count * args.tdm_diversity_group_size
             if budget > 16:
                 logger.warning(
-                    f"TDM diversity term: max(--tdm_step_counts)={max(args.tdm_step_counts)} * "
+                    f"TDM diversity term: --tdm_diversity_step_count={args.tdm_diversity_step_count} * "
                     f"--tdm_diversity_group_size={args.tdm_diversity_group_size} = {budget} simultaneous "
                     "sample-forwards with retained activations for the diversity rollout. This is the "
                     "single largest activation consumer in the step and sets peak VRAM; consider lowering "
@@ -591,7 +596,7 @@ class Krea2TdmDistillNetworkTrainer(Krea2NetworkTrainer):
                 accelerator,
                 transformer,
                 single_prompt_batch,
-                num_steps,
+                args.tdm_diversity_step_count,  # was: num_steps
                 grad_from_step=0,
                 device=device,
                 dit_dtype=dit_dtype,
@@ -680,6 +685,16 @@ def tdm_distill_setup_parser(parser: argparse.ArgumentParser) -> argparse.Argume
         type=int,
         default=4,
         help="Number of same-prompt, different-seed samples per training step used for the diversity term.",
+    )
+    parser.add_argument(
+        "--tdm_diversity_step_count",
+        type=int,
+        default=1,
+        help="Number of Euler rollout steps for the diversity term's own trajectory, independent of "
+        "the main --tdm_step_counts draw. Lower is cheaper (diversity only needs a final image per "
+        "sample to compare, not a faithful few-step-distillation demonstration) and keeps diversity's "
+        "VRAM cost constant across iterations instead of riding on whichever K gets sampled for the "
+        "main objective.",
     )
     parser.add_argument(
         "--tdm_diversity_weight",

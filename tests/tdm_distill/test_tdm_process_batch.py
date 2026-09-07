@@ -35,7 +35,9 @@ def _attach_stub_lora(model, net):
 
 def _prepared_trainer(tiny_k2_model, **arg_overrides):
     trainer = Krea2TdmDistillNetworkTrainer()
-    args = make_args(tdm_step_counts="2,4", learning_rate=1e-4, optimizer_type="AdamW", **arg_overrides)
+    defaults = {"tdm_step_counts": "2,4", "learning_rate": 1e-4, "optimizer_type": "AdamW"}
+    defaults.update(arg_overrides)
+    args = make_args(**defaults)
     acc = FakeAccelerator()
     net = StubLoraNetwork(init_value=1.0)
     net.load_weights = lambda path: "ok"

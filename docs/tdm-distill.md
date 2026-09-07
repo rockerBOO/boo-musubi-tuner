@@ -55,6 +55,7 @@ if needed.
 | `--tdm_turbo_lora_init` | required when on | Turbo LoRA path used to warm-start student + fake-score |
 | `--tdm_step_counts` | `1,2,4,8` | Comma-separated student step counts K, sampled per iteration |
 | `--tdm_diversity_group_size` | 4 | Same-prompt samples per training step for the diversity term |
+| `--tdm_diversity_step_count` | 1 | Euler step count for the diversity term's own rollout, independent of `--tdm_step_counts` |
 | `--tdm_diversity_weight` | 0.1 | Constant weight on the diversity loss (not annealed — see below) |
 | `--tdm_guidance_scale` | required, no default | CFG scale for the teacher's real-score forward (`uncond + scale*(cond-uncond)`); `<= 1.0` disables CFG |
 | `--fake_score_learning_rate` | 10x `--learning_rate` | Fake-score critic's own optimizer LR |
@@ -127,13 +128,14 @@ the student learns — it is not a passive/logging-only metric computed on the s
   (`grad_from_step=0`) so gradient reaches every step of the trajectory, unlike the main TDM
   rollout (which only needs its last step differentiated — see `_student_rollout`'s
   `grad_from_step` parameter and the version-counter hazard noted there). This rollout runs at
-  batch size `--tdm_diversity_group_size` (default 4) for up to `max(--tdm_step_counts)` steps
-  (default 8) — up to 32 sample-forwards with retained activations held simultaneously, not "one
+  batch size `--tdm_diversity_group_size` (default 4) for `--tdm_diversity_step_count` steps
+  (default 1) — sample-forwards with retained activations held simultaneously, not "one
   extra rollout" in any small sense. Peak VRAM from this term scales multiplicatively with
-  `K * group_size`, where `K` is redrawn every iteration from `--tdm_step_counts`; it is the
-  single largest activation consumer in the step whenever the diversity term is enabled. A
-  startup warning fires when `max(--tdm_step_counts) * --tdm_diversity_group_size` exceeds a
-  heuristic threshold (16) so this is visible before training starts.
+  `--tdm_diversity_step_count * group_size`, independent of whatever `K` gets sampled for the main
+  objective from `--tdm_step_counts` each iteration; it is the single largest activation consumer
+  in the step whenever the diversity term is enabled. A startup warning fires when
+  `--tdm_diversity_step_count * --tdm_diversity_group_size` exceeds a heuristic threshold (16) so
+  this is visible before training starts.
 - **VRAM**: one resident transformer plus a VAE decode + DINOv3 forward pass added to every
   training step for the diversity term (see the bullet above for the dominant cost).
 - **`--tdm_guidance_scale > 1.0` together with `--tdm_diversity_weight > 0` needs more VRAM than

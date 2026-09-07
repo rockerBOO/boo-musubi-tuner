@@ -176,3 +176,34 @@ def test_network_dim_default_ok():
     trainer = Krea2TdmDistillNetworkTrainer()
     args = make_args(network_dim=None, network_alpha=1)
     trainer.handle_model_specific_args(args)
+
+
+def test_diversity_step_count_defaults_to_one():
+    args = make_args()
+    assert args.tdm_diversity_step_count == 1
+
+
+def test_diversity_step_count_zero_raises():
+    trainer = Krea2TdmDistillNetworkTrainer()
+    args = make_args(tdm_diversity_step_count=0)
+    with pytest.raises(ValueError, match="tdm_diversity_step_count"):
+        trainer.handle_model_specific_args(args)
+
+
+def test_diversity_step_count_exceeding_max_k_raises():
+    trainer = Krea2TdmDistillNetworkTrainer()
+    args = make_args(tdm_step_counts="1,2,4", tdm_diversity_step_count=5)
+    with pytest.raises(ValueError, match="tdm_diversity_step_count"):
+        trainer.handle_model_specific_args(args)
+
+
+def test_diversity_step_count_at_max_k_ok():
+    trainer = Krea2TdmDistillNetworkTrainer()
+    args = make_args(tdm_step_counts="1,2,4", tdm_diversity_step_count=4)
+    trainer.handle_model_specific_args(args)
+
+
+def test_diversity_step_count_out_of_range_ok_when_tdm_distill_off():
+    trainer = Krea2TdmDistillNetworkTrainer()
+    args = make_args(tdm_distill=False, tdm_diversity_step_count=0)
+    trainer.handle_model_specific_args(args)
