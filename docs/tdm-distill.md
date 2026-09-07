@@ -136,6 +136,12 @@ the student learns — it is not a passive/logging-only metric computed on the s
   heuristic threshold (16) so this is visible before training starts.
 - **VRAM**: one resident transformer plus a VAE decode + DINOv3 forward pass added to every
   training step for the diversity term (see the bullet above for the dominant cost).
+- **`--tdm_guidance_scale > 1.0` together with `--tdm_diversity_weight > 0` needs more VRAM than
+  either alone**: confirmed on a 16GB card (ConvRot INT8, `--blocks_to_swap 26`) that CFG's extra
+  teacher forward and the diversity term's grad-enabled rollout each work fine on their own, but
+  together they OOM mid-step during `accelerator.backward()`. This is a real combined-cost ceiling,
+  not a code bug. If you hit this, reduce `--tdm_diversity_group_size` (2 is the practical minimum),
+  cap `--tdm_step_counts` at a single small value, or use a card with more headroom.
 - **Experimental**: no correctness guarantee against the TDM paper's own results; K2 is not an
   architecture the paper evaluates.
 - **DINOv3 gate**: `facebook/dinov3-vitb16-pretrain-lvd1689m` requires one-time Hugging Face license
