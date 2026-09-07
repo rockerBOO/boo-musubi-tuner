@@ -24,6 +24,7 @@ class Krea2DinoDiversityNetworkTrainer(Krea2NetworkTrainer):
         self._dinov3_embedder = None
         self._vae_ref = None
         self._vae_needs_cpu_return = False
+        self._vae_frozen = False
 
     def handle_model_specific_args(self, args: argparse.Namespace) -> None:
         super().handle_model_specific_args(args)
