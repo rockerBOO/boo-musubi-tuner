@@ -126,6 +126,24 @@ def test_guidance_scale_above_one_ok_with_text_encoder():
     trainer.handle_model_specific_args(args)
 
 
+def test_guidance_scale_above_one_requires_sample_prompts():
+    trainer = Krea2TdmDistillNetworkTrainer()
+    args = make_args(
+        tdm_guidance_scale=3.5,
+        text_encoder="/path/to/qwen3_vl.safetensors",
+        sample_prompts=None,
+        tdm_diversity_weight=0.0,
+    )
+    with pytest.raises(ValueError, match="sample_prompts"):
+        trainer.handle_model_specific_args(args)
+
+
+def test_guidance_scale_at_or_below_one_ok_without_sample_prompts():
+    trainer = Krea2TdmDistillNetworkTrainer()
+    args = make_args(tdm_guidance_scale=1.0, sample_prompts=None, tdm_diversity_weight=0.0)
+    trainer.handle_model_specific_args(args)
+
+
 def test_network_dim_rejected():
     trainer = Krea2TdmDistillNetworkTrainer()
     args = make_args(network_dim=64)

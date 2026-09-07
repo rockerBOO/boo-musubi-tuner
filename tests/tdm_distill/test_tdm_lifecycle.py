@@ -75,15 +75,15 @@ class _FakeEncoder:
     pass
 
 
-def test_on_train_start_caches_uncond_embed_when_cfg_enabled(monkeypatch):
-    calls = {}
+def test_process_sample_prompts_caches_uncond_embed_when_cfg_enabled(monkeypatch):
+    calls = {"prompts_seen": []}
 
     def fake_load(path, dtype, device):
         calls["load_args"] = (path, dtype, device)
         return _FakeEncoder()
 
     def fake_get_embeds(encoder, prompts):
-        calls["prompts"] = prompts
+        calls["prompts_seen"].append(prompts)
         # (B=1, seq=3, L=1, D=2), mask marks first 2 tokens valid
         hiddens = torch.tensor([[[[1.0, 2.0]], [[3.0, 4.0]], [[5.0, 6.0]]]])
         mask = torch.tensor([[True, True, False]])
@@ -91,33 +91,44 @@ def test_on_train_start_caches_uncond_embed_when_cfg_enabled(monkeypatch):
 
     monkeypatch.setattr(tdm_module.krea2_utils, "load_krea2_text_encoder", fake_load)
     monkeypatch.setattr(tdm_module.krea2_utils, "get_krea2_prompt_embeds", fake_get_embeds)
+    monkeypatch.setattr(tdm_module, "load_prompts", lambda path: [{"prompt": "a cat"}])
 
     trainer = Krea2TdmDistillNetworkTrainer()
-    args = make_args(tdm_guidance_scale=3.5, text_encoder="/path/to/qwen3_vl.safetensors", optimizer_type="AdamW")
-    net = StubLoraNetwork()
+    args = make_args(
+        tdm_guidance_scale=3.5,
+        text_encoder="/path/to/qwen3_vl.safetensors",
+        optimizer_type="AdamW",
+        sample_prompts="prompts.txt",
+    )
     acc = FakeAccelerator()
 
     trainer.handle_model_specific_args(args)
-    trainer.on_train_start(args, acc, net, None, None)
+    sample_parameters = trainer.process_sample_prompts(args, acc, args.sample_prompts)
 
     assert calls["load_args"] == ("/path/to/qwen3_vl.safetensors", torch.bfloat16, acc.device)
-    assert calls["prompts"] == [""]
+    assert calls["prompts_seen"] == [["a cat"], [""]]
     # hiddens[0][mask[0]] gathers the first 2 (valid) of 3 token rows -> shape (2, L=1, D=2)
-    assert torch.equal(trainer._teacher_uncond_embed, torch.tensor([[[1.0, 2.0]], [[3.0, 4.0]]]))
+    expected_embed = torch.tensor([[[1.0, 2.0]], [[3.0, 4.0]]])
+    assert torch.equal(trainer._teacher_uncond_embed, expected_embed)
+    assert torch.equal(sample_parameters[0]["krea2_vl_embed"], expected_embed)
 
 
-def test_on_train_start_skips_uncond_embed_when_cfg_disabled(monkeypatch):
-    def fail_load(*a, **kw):
-        raise AssertionError("load_krea2_text_encoder should not be called when CFG is disabled")
+def test_process_sample_prompts_delegates_to_super_when_cfg_disabled(monkeypatch):
+    calls = []
 
-    monkeypatch.setattr(tdm_module.krea2_utils, "load_krea2_text_encoder", fail_load)
+    def fake_super_process_sample_prompts(self, args, accelerator, sample_prompts):
+        calls.append(sample_prompts)
+        return "vanilla-sample-parameters"
+
+    monkeypatch.setattr(tdm_module.Krea2NetworkTrainer, "process_sample_prompts", fake_super_process_sample_prompts)
 
     trainer = Krea2TdmDistillNetworkTrainer()
     args = make_args(tdm_guidance_scale=1.0, optimizer_type="AdamW")
-    net = StubLoraNetwork()
     acc = FakeAccelerator()
 
     trainer.handle_model_specific_args(args)
-    trainer.on_train_start(args, acc, net, None, None)
+    result = trainer.process_sample_prompts(args, acc, "prompts.txt")
 
+    assert result == "vanilla-sample-parameters"
+    assert calls == ["prompts.txt"]
     assert trainer._teacher_uncond_embed is None

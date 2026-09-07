@@ -31,9 +31,21 @@ accelerate launch src/boo_musubi_tuner/tdm_distill/krea2_train_network_tdm_disti
   ... (usual musubi-tuner LoRA training flags)
 ```
 
-`--sample_prompts` is required whenever `--tdm_diversity_weight > 0`: the base trainer only loads
+`--sample_prompts` is required whenever `--tdm_diversity_weight > 0` (the base trainer only loads
 the VAE when sampling is configured, and the diversity term needs the VAE to decode latents to
-pixels. Any prompt file works, even a minimal one.
+pixels) or whenever `--tdm_guidance_scale > 1.0` (the teacher's unconditional CFG embedding is
+computed in `process_sample_prompts`, reusing the text encoder loaded there — see below). Any
+prompt file works, even a minimal one.
+
+`--network_dim`/`--network_alpha`/`--network_weights`/`--dim_from_weights` are not supported with
+`--tdm_distill` and raise an error if passed: the student/fake-score LoRA's per-module rank and
+alpha are always read directly from `--tdm_turbo_lora_init`'s own weights (confirmed on a real
+checkpoint to be non-uniform across modules — a single `--network_dim` can't represent it). The
+turbo LoRA file must use sd-scripts-style key names (`lora_unet_...`); a ComfyUI/diffusers-style
+file (`diffusion_model...`) matches no real module's per-module dim lookup, so every module is
+silently skipped and the LoRA network ends up with zero modules for the transformer — no error,
+no effective LoRA at all. Convert with musubi-tuner's own `convert_lora.py --target default` first
+if needed.
 
 ## Flags
 
@@ -77,10 +89,13 @@ the student learns — it is not a passive/logging-only metric computed on the s
   `ModelOffloader`'s single forward/backward-per-step assumption, which this trainer's multiple
   forwards per step (student rollout, fake-score, teacher, updated fake-score) violate. No test
   exercises `blocks_to_swap > 0` in this extension.
-- **Teacher CFG requires `--text_encoder`**: when `--tdm_guidance_scale > 1.0`, `on_train_start`
-  loads the Qwen3-VL encoder once to build a cached unconditional (empty-prompt) embedding, then
-  frees it — same pattern as `--sample_prompts` encoding. `--tdm_guidance_scale <= 1.0` disables
-  CFG and skips this entirely (single conditional teacher forward, no `--text_encoder` needed).
+- **Teacher CFG requires `--text_encoder` and `--sample_prompts`**: when `--tdm_guidance_scale >
+  1.0`, `process_sample_prompts` builds a cached unconditional (empty-prompt) embedding in the same
+  text-encoder session it uses for sample-prompt caching, before the DiT loads. This is deliberate:
+  a second full text-encoder load in `on_train_start`, after the (possibly quantized, possibly
+  block-swapped) DiT is already resident, was confirmed to OOM on a 16GB card in real testing.
+  `--tdm_guidance_scale <= 1.0` disables CFG and skips this entirely (single conditional teacher
+  forward, no `--text_encoder`/`--sample_prompts` requirement from CFG specifically).
 - **omega_tau is min-SNR only, no importance-sampling term**: the fake-score critic's denoising
   loss (Eq. 7) is weighted by `min_snr_weight` (gamma=5, fixed), re-derived for this module's
   velocity-space critic target from the standard min-SNR weighting strategy (Hang et al. 2023).

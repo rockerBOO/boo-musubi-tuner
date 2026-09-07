@@ -17,7 +17,7 @@ import sys
 
 import torch
 from accelerate import Accelerator
-from musubi_tuner.hv_train_network import clean_memory_on_device, read_config_from_file, setup_parser_common
+from musubi_tuner.hv_train_network import clean_memory_on_device, load_prompts, read_config_from_file, setup_parser_common
 from musubi_tuner.krea2 import krea2_sampling, krea2_utils
 from musubi_tuner.krea2_train_network import Krea2NetworkTrainer, krea2_setup_parser
 from safetensors.torch import load_file
@@ -77,6 +77,14 @@ class Krea2TdmDistillNetworkTrainer(Krea2NetworkTrainer):
             raise ValueError(
                 "--text_encoder is required when --tdm_guidance_scale > 1.0. CFG needs the Qwen3-VL "
                 "encoder to build the unconditional (empty-prompt) embedding once at train start."
+            )
+        if args.tdm_guidance_scale > 1.0 and not args.sample_prompts:
+            raise ValueError(
+                "--sample_prompts is required when --tdm_guidance_scale > 1.0. The unconditional "
+                "(empty-prompt) embedding for CFG is computed in process_sample_prompts, reusing the "
+                "text encoder that's already loaded there before the DiT loads, rather than a second "
+                "full text-encoder reload in on_train_start (which OOMs once the DiT is resident under "
+                "block swap). Point it at any prompt file (a minimal one is fine)."
             )
         if args.gradient_accumulation_steps != 1:
             raise ValueError(
@@ -149,6 +157,53 @@ class Krea2TdmDistillNetworkTrainer(Krea2NetworkTrainer):
 
         return network
 
+    def process_sample_prompts(self, args: argparse.Namespace, accelerator: Accelerator, sample_prompts: str):
+        if not (args.tdm_distill and args.tdm_guidance_scale > 1.0):
+            return super().process_sample_prompts(args, accelerator, sample_prompts)
+
+        # Duplicates Krea2NetworkTrainer.process_sample_prompts's body (rather than calling it and
+        # loading a second encoder afterward) so the teacher's unconditional (empty-prompt) CFG
+        # embedding is computed in the same encoder session as sample-prompt caching -- this runs
+        # before the DiT loads (train()'s _prepare_sampling precedes _load_dit_and_swap), so it's
+        # the only point where loading the ~9GB Qwen3-VL encoder is cheap. Loading it again in
+        # on_train_start, after the quantized DiT + block swap are already resident, OOMs on
+        # VRAM-constrained cards.
+        device = accelerator.device
+        assert args.text_encoder is not None, "--text_encoder is required for sample generation during training"
+        logger.info(f"cache Text Encoder outputs for sample prompt: {sample_prompts}")
+        prompts = load_prompts(sample_prompts)
+
+        encoder = krea2_utils.load_krea2_text_encoder(args.text_encoder, dtype=torch.bfloat16, device=device)
+
+        logger.info("Encoding sample prompts with Qwen3-VL")
+        te_outputs = {}
+        with torch.no_grad():
+            for prompt_dict in prompts:
+                for p in [prompt_dict.get("prompt", ""), prompt_dict.get("negative_prompt", None)]:
+                    if p is None or p in te_outputs:
+                        continue
+                    hiddens, mask = krea2_utils.get_krea2_prompt_embeds(encoder, [p])
+                    te_outputs[p] = hiddens[0][mask[0]].to("cpu")
+
+            hiddens, mask = krea2_utils.get_krea2_prompt_embeds(encoder, [""])
+            self._teacher_uncond_embed = hiddens[0][mask[0]].to("cpu")
+
+        del encoder
+        gc.collect()
+        clean_memory_on_device(device)
+
+        sample_parameters = []
+        for prompt_dict in prompts:
+            prompt_dict_copy = prompt_dict.copy()
+            prompt_dict_copy["krea2_vl_embed"] = te_outputs[prompt_dict.get("prompt", "")]
+            negative_prompt = prompt_dict.get("negative_prompt", None)
+            if negative_prompt is not None:
+                prompt_dict_copy["negative_krea2_vl_embed"] = te_outputs[negative_prompt]
+            sample_parameters.append(prompt_dict_copy)
+
+        clean_memory_on_device(device)
+        return sample_parameters
+
     def on_train_start(
         self,
         args: argparse.Namespace,
@@ -197,13 +252,8 @@ class Krea2TdmDistillNetworkTrainer(Krea2NetworkTrainer):
                     "one of these flags if you hit OOM. (Heuristic threshold, not a hard limit.)"
                 )
 
-        if args.tdm_guidance_scale > 1.0:
-            encoder = krea2_utils.load_krea2_text_encoder(args.text_encoder, dtype=torch.bfloat16, device=accelerator.device)
-            hiddens, mask = krea2_utils.get_krea2_prompt_embeds(encoder, [""])
-            self._teacher_uncond_embed = hiddens[0][mask[0]].to("cpu")
-            del encoder
-            gc.collect()
-            clean_memory_on_device(accelerator.device)
+        # self._teacher_uncond_embed (when args.tdm_guidance_scale > 1.0) is already populated by
+        # process_sample_prompts, which ran earlier, before the DiT loaded.
 
         logger.info(
             f"TDM distillation enabled: step_counts={args.tdm_step_counts}, "

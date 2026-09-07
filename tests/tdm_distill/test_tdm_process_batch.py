@@ -40,6 +40,10 @@ def _prepared_trainer(tiny_k2_model, **arg_overrides):
     net = StubLoraNetwork(init_value=1.0)
     net.load_weights = lambda path: "ok"
     trainer.handle_model_specific_args(args)
+    if args.tdm_guidance_scale > 1.0:
+        # Mirrors the real trainer's call order: process_sample_prompts (which populates
+        # _teacher_uncond_embed for CFG) runs before on_train_start.
+        trainer.process_sample_prompts(args, acc, args.sample_prompts)
     trainer.on_train_start(args, acc, net, tiny_k2_model, None)
     handle = _attach_stub_lora(tiny_k2_model, net)
     return trainer, args, acc, net, handle
@@ -273,15 +277,16 @@ def test_process_batch_cfg_off_single_teacher_forward(tiny_k2_model):
 def test_process_batch_cfg_on_two_teacher_forwards_and_combines(tiny_k2_model, monkeypatch):
     """tdm_guidance_scale > 1.0 must run cond + uncond teacher forwards and combine via cfg_combine."""
     torch.manual_seed(6)
-    # _prepared_trainer's on_train_start runs the real CFG uncond-embed caching path when
-    # tdm_guidance_scale > 1.0 and text_encoder is set -- stub the encoder load so it doesn't try
-    # to read a real file. Shape matches tiny_k2_config's txtlayers=1, txtdim=32.
+    # _prepared_trainer's process_sample_prompts runs the real CFG uncond-embed caching path when
+    # tdm_guidance_scale > 1.0 and text_encoder is set -- stub the encoder load and prompt file read
+    # so they don't try to touch real files. Shape matches tiny_k2_config's txtlayers=1, txtdim=32.
     monkeypatch.setattr(tdm_module.krea2_utils, "load_krea2_text_encoder", lambda path, dtype, device: object())
     monkeypatch.setattr(
         tdm_module.krea2_utils,
         "get_krea2_prompt_embeds",
         lambda encoder, prompts: (torch.randn(1, 2, 1, 32), torch.ones(1, 2, dtype=torch.bool)),
     )
+    monkeypatch.setattr(tdm_module, "load_prompts", lambda path: [{"prompt": "a cat"}])
     trainer, args, acc, net, _handle = _prepared_trainer(
         tiny_k2_model, tdm_guidance_scale=3.5, text_encoder="/path/to/qwen3_vl.safetensors"
     )
