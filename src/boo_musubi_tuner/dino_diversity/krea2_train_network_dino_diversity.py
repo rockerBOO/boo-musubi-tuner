@@ -13,6 +13,7 @@ import itertools
 import logging
 import os
 import sys
+from pathlib import Path
 
 import torch
 from accelerate import Accelerator
@@ -20,6 +21,7 @@ from musubi_tuner.hv_train_network import read_config_from_file, setup_parser_co
 from musubi_tuner.krea2 import krea2_sampling, krea2_utils
 from musubi_tuner.krea2_train_network import Krea2NetworkTrainer, krea2_setup_parser
 from safetensors.torch import load_file
+from torchvision.utils import save_image
 
 from boo_musubi_tuner.diversity.diversity import Dinov3ImageEmbedder, diversity_loss_from_embeddings
 
@@ -308,7 +310,7 @@ class Krea2DinoDiversityNetworkTrainer(Krea2NetworkTrainer):
 
         if args.dino_diversity_memory_efficient:
             div_loss_value = self._diversity_loss_memory_efficient(
-                args, accelerator, transformer, single_prompt_batch, vae, device, dit_dtype, network_dtype
+                args, accelerator, transformer, single_prompt_batch, vae, device, dit_dtype, network_dtype, global_step
             )
             loss_metrics = {
                 "loss/diversity": div_loss_value,
@@ -336,6 +338,7 @@ class Krea2DinoDiversityNetworkTrainer(Krea2NetworkTrainer):
         self._vae_ref = vae
         self._vae_needs_cpu_return = True
         pixel_batch = torch.clamp(pixels.float(), 0.0, 1.0)
+        self._maybe_save_debug_images(args, pixel_batch, global_step)
         embeddings = self._dinov3_embedder.embed_differentiable(pixel_batch)
         div_loss = diversity_loss_from_embeddings(embeddings)
 
@@ -346,7 +349,7 @@ class Krea2DinoDiversityNetworkTrainer(Krea2NetworkTrainer):
         return div_loss, loss_metrics
 
     def _diversity_loss_memory_efficient(
-        self, args, accelerator, transformer, single_prompt_batch, vae, device, dit_dtype, network_dtype
+        self, args, accelerator, transformer, single_prompt_batch, vae, device, dit_dtype, network_dtype, global_step: int
     ) -> float:
         """Two-pass, per-sample gradient accumulation: pass 1 (no_grad, whole group batched) gets
         the embeddings needed to compute the real pairwise loss and its gradient w.r.t. each
@@ -375,6 +378,7 @@ class Krea2DinoDiversityNetworkTrainer(Krea2NetworkTrainer):
             vae.to(device)
             pixels = vae.decode_to_pixels(trajectory[-1].to(vae.dtype))
             pixel_batch = torch.clamp(pixels.float(), 0.0, 1.0)
+            self._maybe_save_debug_images(args, pixel_batch, global_step)
             embeddings_nograd = self._dinov3_embedder.embed_differentiable(pixel_batch)
 
         self._vae_ref = vae
@@ -407,6 +411,19 @@ class Krea2DinoDiversityNetworkTrainer(Krea2NetworkTrainer):
 
         return unweighted_div_loss.detach().item()
 
+    def _maybe_save_debug_images(self, args: argparse.Namespace, pixel_batch: torch.Tensor, global_step: int) -> None:
+        """Dumps the exact post-VAE-decode, pre-DINOv3 pixel tensor to disk. Debugging aid only:
+        a subtly wrong decode/rollout can still produce a numerically-plausible diversity loss,
+        so this lets a human eyeball what DINOv3 is actually scoring."""
+        if not args.dino_diversity_debug_save_images:
+            return
+        if global_step % args.dino_diversity_debug_save_every_n_steps != 0:
+            return
+        debug_dir = Path(args.output_dir) / "dino_diversity_debug"
+        debug_dir.mkdir(parents=True, exist_ok=True)
+        for i in range(pixel_batch.shape[0]):
+            save_image(pixel_batch[i].detach().float().cpu(), debug_dir / f"step{global_step:08d}_sample{i:02d}.png")
+
 
 def dino_diversity_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     """Standalone DINOv3 diversity fine-tuning-specific CLI arguments."""
@@ -437,6 +454,19 @@ def dino_diversity_setup_parser(parser: argparse.ArgumentParser) -> argparse.Arg
         "--dino_diversity_memory_efficient",
         action="store_true",
         help="Two-pass per-sample gradient accumulation to bound peak VRAM. Slower; use when VRAM-constrained.",
+    )
+    parser.add_argument(
+        "--dino_diversity_debug_save_images",
+        action="store_true",
+        help="Save the exact post-VAE-decode, pre-DINOv3 pixel batch to "
+        "<output_dir>/dino_diversity_debug/ as PNGs -- debugging aid to visually confirm the "
+        "rollout/decode is producing correct images before trusting the diversity loss.",
+    )
+    parser.add_argument(
+        "--dino_diversity_debug_save_every_n_steps",
+        type=int,
+        default=1,
+        help="Only save debug images every N steps when --dino_diversity_debug_save_images is set.",
     )
     return parser
 
