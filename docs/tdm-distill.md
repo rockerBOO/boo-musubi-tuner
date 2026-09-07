@@ -55,8 +55,8 @@ DINOv3 CLS-token embeddings, back through a grad-enabled VAE decode, back throug
 grad-enabled student rollout, into the student's LoRA weights. This is implemented via
 `Dinov3ImageEmbedder.embed_differentiable` (`tdm_distill.py`), which deliberately avoids
 `self.processor`'s PIL/numpy pipeline (not differentiable) and instead resizes/normalizes with
-plain tensor ops, and avoids `@torch.no_grad()` (used only by the separate `embed()` convenience
-method for non-training use). When `--tdm_diversity_weight > 0`, this term actively shapes what
+plain tensor ops, and has no `@torch.no_grad()` decorator so gradient can reach the input pixels.
+When `--tdm_diversity_weight > 0`, this term actively shapes what
 the student learns — it is not a passive/logging-only metric computed on the side.
 
 ## Known limitations

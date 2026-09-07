@@ -62,9 +62,9 @@ fake-score critic (a training-only auxiliary network) out of saved checkpoints d
 
 **The DINOv3 diversity term is a real, fully differentiable training signal**, not a passive metric
 computed for logging. `Dinov3ImageEmbedder.embed_differentiable` (`tdm_distill.py`) deliberately
-avoids the class's other method, `embed()` — that one is `@torch.no_grad()` and takes PIL/numpy
-input via `self.processor`, both of which sever the autograd graph. `embed_differentiable` instead
-takes an already-decoded `(N, C, H, W)` tensor and does resize/normalize with plain differentiable
+avoids `self.processor`'s PIL/numpy pipeline and any `@torch.no_grad()`, both of which would sever
+the autograd graph. It instead takes an already-decoded `(N, C, H, W)` tensor and does resize/normalize
+with plain differentiable
 tensor ops, keeping the graph intact from the DINOv3 CLS-token embedding all the way back through
 the VAE decode and the student rollout to the LoRA weights. This required two things elsewhere in
 `process_batch`: (1) the group-diversity rollout is called with `grad_from_step=0` (every step
