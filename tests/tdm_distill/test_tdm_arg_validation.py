@@ -124,3 +124,37 @@ def test_guidance_scale_above_one_ok_with_text_encoder():
     trainer = Krea2TdmDistillNetworkTrainer()
     args = make_args(tdm_guidance_scale=3.5, text_encoder="/path/to/qwen3_vl.safetensors")
     trainer.handle_model_specific_args(args)
+
+
+def test_network_dim_rejected():
+    trainer = Krea2TdmDistillNetworkTrainer()
+    args = make_args(network_dim=64)
+    with pytest.raises(ValueError, match="network_dim"):
+        trainer.handle_model_specific_args(args)
+
+
+def test_network_alpha_rejected():
+    trainer = Krea2TdmDistillNetworkTrainer()
+    args = make_args(network_alpha=64.0)
+    with pytest.raises(ValueError, match="network_alpha"):
+        trainer.handle_model_specific_args(args)
+
+
+def test_network_weights_rejected():
+    trainer = Krea2TdmDistillNetworkTrainer()
+    args = make_args(network_weights="/path/to/other_lora.safetensors")
+    with pytest.raises(ValueError, match="network_weights"):
+        trainer.handle_model_specific_args(args)
+
+
+def test_dim_from_weights_rejected():
+    trainer = Krea2TdmDistillNetworkTrainer()
+    args = make_args(dim_from_weights=True)
+    with pytest.raises(ValueError, match="dim_from_weights"):
+        trainer.handle_model_specific_args(args)
+
+
+def test_network_dim_default_ok():
+    trainer = Krea2TdmDistillNetworkTrainer()
+    args = make_args(network_dim=None, network_alpha=1)
+    trainer.handle_model_specific_args(args)

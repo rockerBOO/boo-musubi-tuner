@@ -12,14 +12,9 @@ from .test_tdm_arg_validation import make_args
 def test_on_train_start_builds_role_switcher_and_fake_score_optimizer():
     trainer = Krea2TdmDistillNetworkTrainer()
     args = make_args(tdm_step_counts="1,2,4,8", learning_rate=1e-4, optimizer_type="AdamW")
+    # Warm-start loading now happens in _build_network (not on_train_start), so the network
+    # arrives here already carrying its warm-started weights.
     net = StubLoraNetwork(init_value=3.0)
-    net._weight_registry = {args.tdm_turbo_lora_init: 3.0}
-
-    def load_weights(path):
-        net.lora_w.data.fill_(net._weight_registry[path])
-        return f"loaded {path}"
-
-    net.load_weights = load_weights
     acc = FakeAccelerator()
 
     trainer.handle_model_specific_args(args)
@@ -46,7 +41,6 @@ def test_fake_score_lr_defaults_to_10x_learning_rate():
     trainer = Krea2TdmDistillNetworkTrainer()
     args = make_args(learning_rate=2e-6, fake_score_learning_rate=None, optimizer_type="AdamW")
     net = StubLoraNetwork()
-    net.load_weights = lambda path: "ok"
     acc = FakeAccelerator()
     trainer.handle_model_specific_args(args)
     trainer.on_train_start(args, acc, net, None, None)
@@ -57,7 +51,6 @@ def test_fake_score_lr_explicit_value_kept():
     trainer = Krea2TdmDistillNetworkTrainer()
     args = make_args(learning_rate=2e-6, fake_score_learning_rate=5e-4, optimizer_type="AdamW")
     net = StubLoraNetwork()
-    net.load_weights = lambda path: "ok"
     acc = FakeAccelerator()
     trainer.handle_model_specific_args(args)
     trainer.on_train_start(args, acc, net, None, None)
@@ -102,7 +95,6 @@ def test_on_train_start_caches_uncond_embed_when_cfg_enabled(monkeypatch):
     trainer = Krea2TdmDistillNetworkTrainer()
     args = make_args(tdm_guidance_scale=3.5, text_encoder="/path/to/qwen3_vl.safetensors", optimizer_type="AdamW")
     net = StubLoraNetwork()
-    net.load_weights = lambda path: "ok"
     acc = FakeAccelerator()
 
     trainer.handle_model_specific_args(args)
@@ -123,7 +115,6 @@ def test_on_train_start_skips_uncond_embed_when_cfg_disabled(monkeypatch):
     trainer = Krea2TdmDistillNetworkTrainer()
     args = make_args(tdm_guidance_scale=1.0, optimizer_type="AdamW")
     net = StubLoraNetwork()
-    net.load_weights = lambda path: "ok"
     acc = FakeAccelerator()
 
     trainer.handle_model_specific_args(args)

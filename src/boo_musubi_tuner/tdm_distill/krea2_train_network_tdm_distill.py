@@ -9,14 +9,18 @@ Internal extension point — no API stability guarantees. Experimental.
 
 import argparse
 import gc
+import importlib
 import itertools
 import logging
+import os
+import sys
 
 import torch
 from accelerate import Accelerator
 from musubi_tuner.hv_train_network import clean_memory_on_device, read_config_from_file, setup_parser_common
 from musubi_tuner.krea2 import krea2_sampling, krea2_utils
 from musubi_tuner.krea2_train_network import Krea2NetworkTrainer, krea2_setup_parser
+from safetensors.torch import load_file
 
 from boo_musubi_tuner.tdm_distill.tdm_distill import (
     LoraRoleSwitcher,
@@ -92,6 +96,58 @@ class Krea2TdmDistillNetworkTrainer(Krea2NetworkTrainer):
                 "--tdm_diversity_weight is 0.0: TDM will train with no diversity term at all "
                 "(plain step/guidance distillation). This is a valid ablation setting, not an error."
             )
+        if args.network_dim is not None:
+            raise ValueError(
+                "--network_dim is not supported with --tdm_distill: the student/fake-score LoRA is built with "
+                "each module's rank inferred directly from --tdm_turbo_lora_init's own weights, not a single "
+                "uniform rank — the turbo LoRA is not guaranteed to use the same rank in every module."
+            )
+        if args.network_alpha != 1:
+            raise ValueError(
+                "--network_alpha is not supported with --tdm_distill: alpha is inferred per-module directly "
+                "from --tdm_turbo_lora_init's own weights."
+            )
+        if args.network_weights is not None:
+            raise ValueError(
+                "--network_weights is not supported with --tdm_distill: the warm-start weights always come "
+                "from --tdm_turbo_lora_init."
+            )
+        if args.dim_from_weights:
+            raise ValueError(
+                "--dim_from_weights is not supported with --tdm_distill: dim/alpha inference from "
+                "--tdm_turbo_lora_init happens automatically."
+            )
+
+    def _build_network(self, args: argparse.Namespace, accelerator: Accelerator, transformer, vae, weight_dtype):
+        if not args.tdm_distill:
+            return super()._build_network(args, accelerator, transformer, vae, weight_dtype)
+
+        # Mirrors trainer_base.py's own sys.path setup in _build_network, which lets short module
+        # paths like `networks.lora_krea2` (relative to the musubi_tuner package dir) resolve. We
+        # can't reuse that method here since it always builds a single-uniform-rank network from
+        # --network_dim/--network_alpha; TDM's warm-start LoRA is not guaranteed to be uniform-rank
+        # across modules (confirmed on a real Turbo LoRA: its projector module is rank 1 while every
+        # transformer block is rank 64), so the network must be shaped from the weights file itself.
+        sys.path.append(os.path.dirname(os.path.dirname(krea2_utils.__file__)))
+        accelerator.print("import network module:", args.network_module)
+        network_module = importlib.import_module(args.network_module)
+
+        weights_sd = load_file(args.tdm_turbo_lora_init)
+        network = network_module.create_arch_network_from_weights(1.0, weights_sd, unet=transformer)
+
+        if hasattr(network_module, "prepare_network"):
+            network.prepare_network(args)
+
+        network.apply_to(None, transformer, apply_text_encoder=False, apply_unet=True)
+
+        info = network.load_weights(args.tdm_turbo_lora_init)
+        accelerator.print(f"loaded Turbo LoRA warm-start weights from {args.tdm_turbo_lora_init}: {info}")
+
+        if args.gradient_checkpointing:
+            transformer.enable_gradient_checkpointing(args.gradient_checkpointing_cpu_offload)
+            network.enable_gradient_checkpointing()
+
+        return network
 
     def on_train_start(
         self,
@@ -106,9 +162,6 @@ class Krea2TdmDistillNetworkTrainer(Krea2NetworkTrainer):
             return
 
         unwrapped_nw = accelerator.unwrap_model(network)
-        info = unwrapped_nw.load_weights(args.tdm_turbo_lora_init)
-        accelerator.print(f"loaded Turbo LoRA warm-start weights from {args.tdm_turbo_lora_init}: {info}")
-
         self._role_switcher = LoraRoleSwitcher(unwrapped_nw)
         self._role_switcher.init_from(unwrapped_nw.state_dict())
 
