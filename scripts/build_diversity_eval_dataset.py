@@ -3,8 +3,7 @@
 Reuses smoke_test_data's 4 fixture images (content is discarded by the TDM distill trainer,
 only latent shape matters) and, where possible, its already-computed 256x256 latent caches, to
 avoid re-encoding duplicate image content 300 times. Text-encoder caching still runs for real
-since every caption is unique. See
-docs/superpowers/specs/2026-09-07-tdm-diversity-eval-dataset-design.md for the full design.
+since every caption is unique.
 """
 
 import argparse
@@ -82,9 +81,13 @@ def run_cache_latents_for_missing(needs_compute: list[int], vae_path: str) -> No
     )
     subprocess.run(
         [
-            sys.executable, "-m", "musubi_tuner.krea2_cache_latents",
-            "--dataset_config", str(DATASET_CONFIG_PATH),
-            "--vae", vae_path,
+            sys.executable,
+            "-m",
+            "musubi_tuner.krea2_cache_latents",
+            "--dataset_config",
+            str(DATASET_CONFIG_PATH),
+            "--vae",
+            vae_path,
         ],
         check=True,
     )
@@ -93,9 +96,13 @@ def run_cache_latents_for_missing(needs_compute: list[int], vae_path: str) -> No
 def run_cache_text_encoder_outputs(text_encoder_path: str) -> None:
     subprocess.run(
         [
-            sys.executable, "-m", "musubi_tuner.krea2_cache_text_encoder_outputs",
-            "--dataset_config", str(DATASET_CONFIG_PATH),
-            "--text_encoder", text_encoder_path,
+            sys.executable,
+            "-m",
+            "musubi_tuner.krea2_cache_text_encoder_outputs",
+            "--dataset_config",
+            str(DATASET_CONFIG_PATH),
+            "--text_encoder",
+            text_encoder_path,
         ],
         check=True,
     )
@@ -103,8 +110,16 @@ def run_cache_text_encoder_outputs(text_encoder_path: str) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--vae", required=True, help="Path to the Qwen-Image VAE checkpoint (used only if a placeholder image's latent cache can't be copied from smoke_test_data).")
-    parser.add_argument("--text_encoder", required=True, help="Path to the Qwen3-VL text encoder checkpoint (used for every item, since captions are unique).")
+    parser.add_argument(
+        "--vae",
+        required=True,
+        help="Path to the Qwen-Image VAE checkpoint (used only if a placeholder image's latent cache can't be copied from smoke_test_data).",
+    )
+    parser.add_argument(
+        "--text_encoder",
+        required=True,
+        help="Path to the Qwen3-VL text encoder checkpoint (used for every item, since captions are unique).",
+    )
     args = parser.parse_args()
 
     prompts = [line.strip() for line in PROMPTS_PATH.read_text(encoding="utf-8").splitlines() if line.strip()]
