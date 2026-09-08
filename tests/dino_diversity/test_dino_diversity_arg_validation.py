@@ -98,6 +98,43 @@ def test_missing_dataset_config_raises():
         trainer.handle_model_specific_args(args)
 
 
+def test_pass1_chunk_size_defaults_to_none():
+    args = make_args()
+    assert args.dino_diversity_pass1_chunk_size is None
+
+
+def test_pass1_chunk_size_zero_raises():
+    trainer = Krea2DinoDiversityNetworkTrainer()
+    args = make_args(dino_diversity_pass1_chunk_size=0)
+    with pytest.raises(ValueError, match="dino_diversity_pass1_chunk_size"):
+        trainer.handle_model_specific_args(args)
+
+
+def test_pass1_chunk_size_exceeding_group_size_raises():
+    trainer = Krea2DinoDiversityNetworkTrainer()
+    args = make_args(dino_diversity_group_size=4, dino_diversity_pass1_chunk_size=5, network_alpha=1)
+    with pytest.raises(ValueError, match="dino_diversity_pass1_chunk_size"):
+        trainer.handle_model_specific_args(args)
+
+
+def test_pass1_chunk_size_equal_group_size_ok():
+    trainer = Krea2DinoDiversityNetworkTrainer()
+    args = make_args(dino_diversity_group_size=4, dino_diversity_pass1_chunk_size=4, network_alpha=1)
+    trainer.handle_model_specific_args(args)
+
+
+def test_pass1_chunk_size_below_group_size_ok():
+    trainer = Krea2DinoDiversityNetworkTrainer()
+    args = make_args(dino_diversity_group_size=4, dino_diversity_pass1_chunk_size=1, network_alpha=1)
+    trainer.handle_model_specific_args(args)
+
+
+def test_pass1_chunk_size_out_of_range_ok_when_dino_diversity_off():
+    trainer = Krea2DinoDiversityNetworkTrainer()
+    args = make_args(dino_diversity=False, dino_diversity_group_size=4, dino_diversity_pass1_chunk_size=99)
+    trainer.handle_model_specific_args(args)
+
+
 def test_all_constraints_ok_when_dino_diversity_off():
     trainer = Krea2DinoDiversityNetworkTrainer()
     args = make_args(

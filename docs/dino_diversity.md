@@ -47,6 +47,7 @@ uniform-rank across modules).
 | `--dino_diversity_group_size` | 4 | Same-prompt, different-seed samples per training step |
 | `--dino_diversity_step_count` | 8 | Euler rollout steps per sample (full inference-length by default — no distillation critic competing for VRAM here) |
 | `--dino_diversity_memory_efficient` | off | Two-pass per-sample gradient accumulation; same math, lower peak VRAM, slower |
+| `--dino_diversity_pass1_chunk_size` | `--dino_diversity_group_size` | Sub-batch size for the memory-efficient path's pass 1 forward. Lower this independently of `--dino_diversity_group_size` to raise group size (more diverse comparison set) without raising pass 1's peak VRAM |
 | `--dino_diversity_debug_save_images` | off | Save the exact post-VAE-decode, pre-DINOv3 pixel batch to `<output_dir>/dino_diversity_debug/` as PNGs — debugging aid to confirm the rollout/decode is producing correct images before trusting the diversity loss |
 | `--dino_diversity_debug_save_every_n_steps` | 1 | Throttle for the above — only save every N steps |
 
@@ -64,7 +65,15 @@ uniform-rank across modules).
 - **VRAM**: full-step-count (default 8), full-gradient rollouts at `group_size=4` build a
   substantially larger graph than `tdm_distill`'s diversity term ever does by default (which
   uses `step_count=1`, `group_size=2`) — use `--dino_diversity_memory_efficient` on
-  VRAM-constrained hardware.
+  VRAM-constrained hardware. Note that `--dino_diversity_memory_efficient`'s pass 1 (which gets
+  every sample's embedding before the per-sample backward pass) still runs the whole group
+  through one no_grad forward by default — no backward graph is retained, but forward-pass
+  activation memory (attention, VAE decode) still scales with batch size, so a large `group_size`
+  can still OOM pass 1 even with `--dino_diversity_memory_efficient` on. Set
+  `--dino_diversity_pass1_chunk_size` below `group_size` to bound pass 1's peak VRAM
+  independently of how large a group you want for the diversity comparison itself (e.g.
+  `--dino_diversity_group_size 4 --dino_diversity_pass1_chunk_size 2` on a 16GB card that OOMs
+  at `group_size=4` but fits `group_size=2`).
 - **Experimental / unvalidated combination**: Krea's report validates this diversity technique
   on their prompt-expander RL setup, not as a direct fine-tuning loss on a distilled image
   generator's own LoRA weights.

@@ -56,6 +56,14 @@ class Krea2DinoDiversityNetworkTrainer(Krea2NetworkTrainer):
         if args.dino_diversity_step_count < 1:
             raise ValueError(f"--dino_diversity_step_count ({args.dino_diversity_step_count}) must be >= 1.")
 
+        if args.dino_diversity_pass1_chunk_size is not None and not (
+            1 <= args.dino_diversity_pass1_chunk_size <= args.dino_diversity_group_size
+        ):
+            raise ValueError(
+                f"--dino_diversity_pass1_chunk_size ({args.dino_diversity_pass1_chunk_size}) must be between 1 "
+                f"and --dino_diversity_group_size ({args.dino_diversity_group_size}), inclusive."
+            )
+
         if args.network_dim is not None:
             raise ValueError(
                 "--network_dim is rejected when --dino_diversity is set. Rank/alpha come from "
@@ -368,12 +376,12 @@ class Krea2DinoDiversityNetworkTrainer(Krea2NetworkTrainer):
     def _diversity_loss_memory_efficient(
         self, args, accelerator, transformer, single_prompt_batch, vae, device, dit_dtype, network_dtype, global_step: int
     ) -> float:
-        """Two-pass, per-sample gradient accumulation: pass 1 (no_grad, whole group batched) gets
-        the embeddings needed to compute the real pairwise loss and its gradient w.r.t. each
-        embedding; pass 2 (grad, one sample at a time) reuses pass 1's exact noise draw per sample
-        to re-derive each embedding differentiably and backprops the cached upstream gradient into
-        just that sample's rollout. Mathematically identical gradient to the batched path, bounded
-        peak VRAM. Backward happens here, per-sample -- the caller must not call .backward() again
+        """Two-pass, per-sample gradient accumulation: pass 1 (no_grad, optionally chunked via
+        --dino_diversity_pass1_chunk_size) gets the embeddings needed to compute the real pairwise
+        loss and its gradient w.r.t. each embedding; pass 2 (grad, one sample at a time) reuses
+        pass 1's exact noise draw per sample to re-derive each embedding differentiably and
+        backprops the cached upstream gradient into just that sample's rollout. Mathematically
+        identical gradient to the batched path, bounded peak VRAM. Backward happens here, per-sample -- the caller must not call .backward() again
         on this method's return value."""
         group_size = args.dino_diversity_group_size
         model = accelerator.unwrap_model(transformer)
@@ -381,22 +389,35 @@ class Krea2DinoDiversityNetworkTrainer(Krea2NetworkTrainer):
         lat_w = single_prompt_batch["latents"].shape[-1]
         noise_batch = torch.randn(group_size, model.config.channels, 1, lat_h, lat_w, device=device, dtype=dit_dtype)
 
+        # Pass 1 retains no backward graph, but its forward-pass activation memory (attention,
+        # VAE decode, DINOv3 embed) still scales with batch size -- chunking bounds that peak to
+        # chunk_size regardless of group_size, so group_size (diversity quality) and peak VRAM
+        # (chunk size) are independent knobs. Defaults to group_size (one batched forward).
+        chunk_size = args.dino_diversity_pass1_chunk_size or group_size
+        embeddings_chunks = []
         with torch.no_grad():
-            trajectory, _ts = self._rollout(
-                args,
-                accelerator,
-                transformer,
-                single_prompt_batch,
-                device=device,
-                dit_dtype=dit_dtype,
-                network_dtype=network_dtype,
-                noise=noise_batch,
-            )
-            vae.to(device)
-            pixels = vae.decode_to_pixels(trajectory[-1].to(vae.dtype))
-            pixel_batch = torch.clamp(pixels.float(), 0.0, 1.0)
-            self._maybe_save_debug_images(args, pixel_batch, global_step)
-            embeddings_nograd = self._dinov3_embedder.embed_differentiable(pixel_batch)
+            for start in range(0, group_size, chunk_size):
+                end = min(start + chunk_size, group_size)
+                chunk_batch = {
+                    "krea2_vl_embed": single_prompt_batch["krea2_vl_embed"][start:end],
+                    "latents": single_prompt_batch["latents"][start:end],
+                }
+                trajectory, _ts = self._rollout(
+                    args,
+                    accelerator,
+                    transformer,
+                    chunk_batch,
+                    device=device,
+                    dit_dtype=dit_dtype,
+                    network_dtype=network_dtype,
+                    noise=noise_batch[start:end],
+                )
+                vae.to(device)
+                pixels = vae.decode_to_pixels(trajectory[-1].to(vae.dtype))
+                pixel_batch = torch.clamp(pixels.float(), 0.0, 1.0)
+                self._maybe_save_debug_images(args, pixel_batch, global_step)
+                embeddings_chunks.append(self._dinov3_embedder.embed_differentiable(pixel_batch))
+        embeddings_nograd = torch.cat(embeddings_chunks, dim=0)
 
         self._vae_ref = vae
         self._vae_needs_cpu_return = True
@@ -471,6 +492,17 @@ def dino_diversity_setup_parser(parser: argparse.ArgumentParser) -> argparse.Arg
         "--dino_diversity_memory_efficient",
         action="store_true",
         help="Two-pass per-sample gradient accumulation to bound peak VRAM. Slower; use when VRAM-constrained.",
+    )
+    parser.add_argument(
+        "--dino_diversity_pass1_chunk_size",
+        type=int,
+        default=None,
+        help="Sub-batch size for the memory-efficient path's pass 1 (the no_grad, whole-group forward "
+        "that gets each sample's embedding). Pass 1 retains no backward graph, but its forward-pass "
+        "activation memory still scales with batch size, so a large --dino_diversity_group_size can "
+        "still OOM pass 1 even though pass 2 is already bounded to one sample at a time. Defaults to "
+        "--dino_diversity_group_size (one batched forward, today's behavior) when unset; set lower to "
+        "trade speed for peak VRAM independently of group size.",
     )
     parser.add_argument(
         "--dino_diversity_debug_save_images",
