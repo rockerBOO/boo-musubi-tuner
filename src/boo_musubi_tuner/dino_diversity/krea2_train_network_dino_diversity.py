@@ -268,9 +268,10 @@ class Krea2DinoDiversityNetworkTrainer(Krea2NetworkTrainer):
         x2 = (1280 // (8 * patch)) ** 2
         ts = krea2_sampling.timesteps(imglen, args.dino_diversity_step_count, x1, x2, y1=0.5, y2=1.15, mu=1.15)
 
+        debug_mem = os.getenv("DINO_DIVERSITY_DEBUG_MEM") == "1" and device.type == "cuda"
         img = noise
         trajectory = [img]
-        for tcurr, tprev in itertools.pairwise(ts):
+        for step_idx, (tcurr, tprev) in enumerate(itertools.pairwise(ts)):
             timesteps_t = torch.full((bsize,), tcurr * 1000.0, device=device, dtype=torch.float32)
             output = self.call_dit(args, accelerator, transformer, img, batch, noise, img, timesteps_t, network_dtype)
             # call_dit's DiTOutput.pred is the model's direct velocity prediction (not yet
@@ -278,6 +279,16 @@ class Krea2DinoDiversityNetworkTrainer(Krea2NetworkTrainer):
             # own `img = img + (tprev - tcurr) * v` in krea2_train_network.py.
             img = img + (tprev - tcurr) * output.pred
             trajectory.append(img)
+            if debug_mem:
+                logger.info(
+                    "_rollout bsize=%d grad=%s step=%d/%d allocated=%.2fGB reserved=%.2fGB",
+                    bsize,
+                    torch.is_grad_enabled(),
+                    step_idx + 1,
+                    len(ts) - 1,
+                    torch.cuda.memory_allocated(device) / 1e9,
+                    torch.cuda.memory_reserved(device) / 1e9,
+                )
         return trajectory, list(ts)
 
     def process_batch(
@@ -446,6 +457,15 @@ class Krea2DinoDiversityNetworkTrainer(Krea2NetworkTrainer):
             sample_pixel_batch = torch.clamp(sample_pixels.float(), 0.0, 1.0)
             sample_embedding = self._dinov3_embedder.embed_differentiable(sample_pixel_batch)
             accelerator.backward(sample_embedding, gradient=upstream_grad[i : i + 1])
+            if os.getenv("DINO_DIVERSITY_DEBUG_MEM") == "1" and device.type == "cuda":
+                logger.info(
+                    "pass2 sample=%d/%d backward done allocated=%.2fGB reserved=%.2fGB peak_allocated=%.2fGB",
+                    i + 1,
+                    group_size,
+                    torch.cuda.memory_allocated(device) / 1e9,
+                    torch.cuda.memory_reserved(device) / 1e9,
+                    torch.cuda.max_memory_allocated(device) / 1e9,
+                )
 
         return unweighted_div_loss.detach().item()
 
