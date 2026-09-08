@@ -264,12 +264,11 @@ class Krea2DinoDiversityNetworkTrainer(Krea2NetworkTrainer):
         trajectory = [img]
         for tcurr, tprev in itertools.pairwise(ts):
             timesteps_t = torch.full((bsize,), tcurr * 1000.0, device=device, dtype=torch.float32)
-            with torch.enable_grad():
-                output = self.call_dit(args, accelerator, transformer, img, batch, noise, img, timesteps_t, network_dtype)
-                # call_dit's DiTOutput.pred is the model's direct velocity prediction (not yet
-                # compared to a target), so integrate it directly on img -- matches do_inference's
-                # own `img = img + (tprev - tcurr) * v` in krea2_train_network.py.
-                img = img + (tprev - tcurr) * output.pred
+            output = self.call_dit(args, accelerator, transformer, img, batch, noise, img, timesteps_t, network_dtype)
+            # call_dit's DiTOutput.pred is the model's direct velocity prediction (not yet
+            # compared to a target), so integrate it directly on img -- matches do_inference's
+            # own `img = img + (tprev - tcurr) * v` in krea2_train_network.py.
+            img = img + (tprev - tcurr) * output.pred
             trajectory.append(img)
         return trajectory, list(ts)
 
@@ -331,10 +330,14 @@ class Krea2DinoDiversityNetworkTrainer(Krea2NetworkTrainer):
                 "diversity/score": -div_loss_value,
             }
             # Backward already happened inside _diversity_loss_memory_efficient (per-sample).
-            # Return a zero tensor so the outer training loop's loss.backward() is a harmless
-            # no-op (0 has no gradient contribution) rather than double-applying the diversity
-            # gradient.
-            return torch.zeros((), device=device, requires_grad=False), loss_metrics
+            # The outer training loop unconditionally calls accelerator.backward(loss) on
+            # whatever we return, so we can't hand back a requires_grad=False tensor (no
+            # grad_fn -> RuntimeError). `dummy + div_loss_value` has a grad_fn (addition) but
+            # dummy has no upstream connection to the model, so backward through it contributes
+            # nothing and doesn't double-apply the diversity gradient. It also reports the true
+            # diversity loss value for logging instead of always 0.0.
+            dummy = torch.zeros((), device=device, requires_grad=True)
+            return dummy + div_loss_value, loss_metrics
 
         trajectory, _ts = self._rollout(
             args,

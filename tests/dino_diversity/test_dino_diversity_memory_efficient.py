@@ -72,3 +72,82 @@ def test_memory_efficient_backprops_inside_process_batch(tiny_k2_config):
     calls loss.backward() on the returned value."""
     _loss, _metrics, net = _run(tiny_k2_config, seed=12, memory_efficient=True)
     assert net.lora_w.grad is not None
+
+
+def test_process_batch_return_value_is_backwardable_both_paths(tiny_k2_config):
+    """Regression guard for the Critical bug where the memory-efficient path returned a
+    requires_grad=False tensor: musubi-tuner's real outer training loop unconditionally calls
+    accelerator.backward(loss) on whatever process_batch returns, for every path. A tensor with
+    no grad_fn makes that call raise RuntimeError."""
+    for memory_efficient in (False, True):
+        torch.manual_seed(42)
+        model = SingleStreamDiT(tiny_k2_config, attn_mode="torch")
+        model.eval()
+        for p in model.parameters():
+            p.requires_grad_(True)
+        trainer = Krea2DinoDiversityNetworkTrainer()
+        args = make_args(dino_diversity_step_count=2, dino_diversity_group_size=3, dino_diversity_memory_efficient=memory_efficient)
+        acc = FakeAccelerator()
+        net = StubLoraNetwork(init_value=1.0)
+        net.load_weights = lambda path: "ok"
+        trainer.handle_model_specific_args(args)
+        trainer.on_train_start(args, acc, net, model, None)
+        trainer._dinov3_embedder = _StubDinov3Embedder()
+        handle = _attach_stub_lora(model, net)
+
+        batch, latents, noise = make_k2_batch(B=1, H=8, W=8, n_txt=3)
+        scheduler = make_noise_scheduler(args)
+        vae = _StubVae()
+
+        loss, _metrics = trainer.process_batch(
+            args, acc, model, net, batch, latents, noise, scheduler, torch.float32, torch.float32, vae, global_step=0
+        )
+        handle.remove()
+
+        # This mirrors what musubi-tuner's real outer training loop does: it unconditionally
+        # calls accelerator.backward(loss) on whatever process_batch returns, for every path.
+        acc.backward(loss)
+        assert torch.isfinite(loss)
+
+
+def test_memory_efficient_pass1_rollout_is_graph_free(tiny_k2_config):
+    """Regression guard for the Critical bug where _rollout's unconditional
+    torch.enable_grad() defeated pass 1's enclosing no_grad() context, building a full
+    autograd graph for the whole group and defeating the memory-efficient path's entire
+    VRAM-bounding purpose."""
+    torch.manual_seed(13)
+    model = SingleStreamDiT(tiny_k2_config, attn_mode="torch")
+    model.eval()
+    for p in model.parameters():
+        p.requires_grad_(True)
+
+    trainer = Krea2DinoDiversityNetworkTrainer()
+    args = make_args(dino_diversity_step_count=2, dino_diversity_group_size=3, dino_diversity_memory_efficient=True)
+    acc = FakeAccelerator()
+    net = StubLoraNetwork(init_value=1.0)
+    net.load_weights = lambda path: "ok"
+    trainer.handle_model_specific_args(args)
+    trainer.on_train_start(args, acc, net, model, None)
+    trainer._dinov3_embedder = _StubDinov3Embedder()
+    handle = _attach_stub_lora(model, net)
+
+    batch, latents, noise = make_k2_batch(B=1, H=8, W=8, n_txt=3)
+    scheduler = make_noise_scheduler(args)
+    vae = _StubVae()
+
+    recorded = []
+    original_rollout = trainer._rollout
+
+    def spy_rollout(*args_, **kwargs_):
+        trajectory, ts = original_rollout(*args_, **kwargs_)
+        recorded.append(trajectory)
+        return trajectory, ts
+
+    trainer._rollout = spy_rollout
+
+    trainer.process_batch(args, acc, model, net, batch, latents, noise, scheduler, torch.float32, torch.float32, vae, global_step=0)
+    handle.remove()
+
+    # First recorded call is pass 1's no_grad, group-sized rollout.
+    pass1_trajectory = recorded[0]
+    assert pass1_trajectory[-1].grad_fn is None
