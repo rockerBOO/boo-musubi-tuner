@@ -19,6 +19,7 @@ Internal extension point — no API stability guarantees.
 """
 
 import argparse
+import contextlib
 import logging
 import os
 
@@ -626,21 +627,34 @@ class Krea2SelfFlowNetworkTrainer(Krea2NetworkTrainer):
         # block swap ran forward-only for the teacher; re-prepare device placement
         accelerator.unwrap_model(transformer).prepare_block_swap_before_forward()
 
-        # 4. student forward: gradients flow, per-token timesteps via hooks
-        output = self.call_dit(
-            args,
-            accelerator,
-            transformer,
-            latents,
-            batch,
-            noise,
-            noisy_input_student,
-            timesteps_student,
-            network_dtype,
-            hidden_features=True,
-            feature_layer=args.student_feature_layer,
-            per_token_timesteps=per_token_timesteps_student,
+        # 4. student forward: gradients flow, per-token timesteps via hooks.
+        # save_on_cpu offloads the per-block checkpoint-boundary activations
+        # (the tensors gradient_checkpointing still keeps on GPU across the
+        # forward/backward gap) to pinned host memory, freeing that GPU
+        # memory until backward actually needs them back. Orthogonal to
+        # block-swap, which only streams frozen weights, not activations.
+        # Opt-in (--self_flow_save_activations_on_cpu): costs H2D/D2H copies
+        # every step, only worth it if you're OOMing.
+        activation_offload = (
+            torch.autograd.graph.save_on_cpu(pin_memory=True)
+            if args.self_flow_save_activations_on_cpu
+            else contextlib.nullcontext()
         )
+        with activation_offload:
+            output = self.call_dit(
+                args,
+                accelerator,
+                transformer,
+                latents,
+                batch,
+                noise,
+                noisy_input_student,
+                timesteps_student,
+                network_dtype,
+                hidden_features=True,
+                feature_layer=args.student_feature_layer,
+                per_token_timesteps=per_token_timesteps_student,
+            )
         feat_student = output.extra.get("features")
 
         # 5. L_gen via the base loss (weighting from student timesteps), then L_rep
@@ -769,7 +783,16 @@ class Krea2SelfFlowNetworkTrainer(Krea2NetworkTrainer):
         """Compose Krea2NetworkTrainer's RAW->Turbo base-weight swap (if
         --turbo_dit) with Self-Flow's student->EMA network-weight swap.
         These touch different objects (transformer base weights vs. LoRA
-        network weights) so they don't conflict, but both must run."""
+        network weights) so they don't conflict, but both must run.
+
+        Also releases PyTorch's cached (but unused) CUDA blocks before
+        sampling: the training step's peak allocator reservation stays
+        cached for reuse across steps and is never freed on its own, but
+        the VAE decode that follows sampling needs its own differently-
+        shaped allocation and can OOM competing for the last sliver of
+        device memory otherwise (seen in practice on 16GB cards with
+        --self_flow_save_activations_on_cpu / tight block-swap margins)."""
+        torch.cuda.empty_cache()
         super().on_before_sample_images(accelerator, args, epoch, steps, vae, transformer, network, sample_parameters, dit_dtype)
         if not args.self_flow or self.ema_lora_state is None:
             return
@@ -862,6 +885,14 @@ def self_flow_setup_parser(parser: argparse.ArgumentParser) -> argparse.Argument
         type=float,
         default=1.0,
         help="When the coupling gate fires, fraction of masked patches receiving the timestep mismatch.",
+    )
+    parser.add_argument(
+        "--self_flow_save_activations_on_cpu",
+        action="store_true",
+        help="Offload the student forward's gradient-checkpoint boundary activations to pinned CPU memory "
+        "(torch.autograd.graph.save_on_cpu) instead of keeping all of them GPU-resident across the "
+        "forward/backward gap. Frees several hundred MB to a few GB depending on resolution/depth, at the "
+        "cost of H2D/D2H copies each step (slower). Enable only if you're OOMing; otherwise leave off.",
     )
     parser.add_argument(
         "--network_weights_ema",
