@@ -27,6 +27,7 @@ from accelerate import Accelerator
 from musubi_tuner.hv_train_network import read_config_from_file, setup_parser_common
 from musubi_tuner.krea2.krea2_mmdit import temb
 from musubi_tuner.krea2_train_network import Krea2NetworkTrainer, krea2_setup_parser
+from musubi_tuner.training.trainer_base import DiTOutput
 from musubi_tuner.utils import huggingface_utils
 from safetensors.torch import load_file, save_file
 
@@ -256,6 +257,15 @@ class PerTokenModulationController:
         return scale, shift
 
 
+class _FeatureCaptured(Exception):
+    """Sentinel raised by BlockFeatureExtractor's hook to abort a forward pass
+    early once the armed layer's feature has been captured (see `arm(...,
+    abort=True)`). K2 blocks are purely sequential — block N's output depends
+    only on blocks 0..N, never on later blocks — so raising here and skipping
+    the remaining blocks does not change the captured feature; it only skips
+    computation whose result would otherwise be discarded by the caller."""
+
+
 class BlockFeatureExtractor:
     """Captures hidden states from K2 SingleStreamBlocks via forward hooks.
 
@@ -275,6 +285,7 @@ class BlockFeatureExtractor:
         self._armed_layer: int | None = None
         self._imglen: int | None = None
         self._features: torch.Tensor | None = None
+        self._abort: bool = False
 
     def install(self, model, layer_indices: list[int]) -> None:
         num_blocks = len(model.blocks)
@@ -290,24 +301,32 @@ class BlockFeatureExtractor:
             handle.remove()
         self._handles.clear()
 
-    def arm(self, layer: int, imglen: int) -> None:
+    def arm(self, layer: int, imglen: int, abort: bool = False) -> None:
+        """abort=True raises _FeatureCaptured right after this layer's hook
+        fires, skipping every later block. Only safe for a no-grad,
+        output-discarding forward (e.g. the Self-Flow teacher pass) — never
+        set this for a pass whose final output/loss is actually used."""
         if layer not in self._installed_layers:
             raise ValueError(f"feature layer {layer} was not installed (installed: {sorted(self._installed_layers)})")
         self._armed_layer = layer
         self._imglen = imglen
         self._features = None
+        self._abort = abort
 
     def drain(self) -> torch.Tensor | None:
         features = self._features
         self._features = None
         self._armed_layer = None
         self._imglen = None
+        self._abort = False
         return features
 
     def _make_hook(self, layer: int):
         def hook(module, inputs, output):
             if self._armed_layer == layer:
                 self._features = output[:, : self._imglen, :]
+                if self._abort:
+                    raise _FeatureCaptured()
 
         return hook
 
@@ -485,12 +504,20 @@ class Krea2SelfFlowNetworkTrainer(Krea2NetworkTrainer):
         - ``hidden_features`` (bool): when True, return captured features in
           ``DiTOutput.extra["features"]`` (drained from ``self._feature_extractor``).
         - ``feature_layer`` (int): which registered layer's output to return.
+        - ``early_exit_after_feature`` (bool): abort the forward immediately
+          after ``feature_layer``'s hook fires, skipping every later block.
+          Only valid when the caller discards ``output.pred``/``output.target``
+          and uses solely ``output.extra["features"]`` — e.g. the Self-Flow
+          teacher pass, which is already ``torch.no_grad()`` and whose main
+          output is never read. Do not set this for a pass whose loss actually
+          depends on the full model output.
         - ``per_token_timesteps`` (Tensor): (B, imglen) per-image-token timestep
           map for dual-timestep conditioning. Staged into
           ``self._modulation_controller`` before the forward and cleared after.
         """
         hidden_features = kwargs.pop("hidden_features", False)
         feature_layer = kwargs.pop("feature_layer", None)
+        early_exit_after_feature = kwargs.pop("early_exit_after_feature", False)
         per_token_timesteps = kwargs.pop("per_token_timesteps", None)
 
         if not hidden_features and per_token_timesteps is None:
@@ -517,16 +544,23 @@ class Krea2SelfFlowNetworkTrainer(Krea2NetworkTrainer):
             tau_full = torch.cat([tau_img, tau_global], dim=1)
             self._modulation_controller.stage(tau_full)
         if hidden_features:
-            self._feature_extractor.arm(feature_layer, imglen)
+            self._feature_extractor.arm(feature_layer, imglen, abort=early_exit_after_feature)
         features = None
+        output = None
         try:
             output = super().call_dit(
                 args, accelerator, transformer, latents, batch, noise, noisy_model_input, timesteps, network_dtype, **kwargs
             )
+        except _FeatureCaptured:
+            pass
         finally:
             self._modulation_controller.clear()
             if hidden_features:
                 features = self._feature_extractor.drain()
+        if output is None:
+            # early_exit_after_feature aborted before the model returned — the
+            # caller only reads extra["features"], pred/target are unused.
+            output = DiTOutput(pred=None, target=None)
         if hidden_features:
             output.extra["features"] = features
         return output
@@ -618,6 +652,7 @@ class Krea2SelfFlowNetworkTrainer(Krea2NetworkTrainer):
                     network_dtype,
                     hidden_features=True,
                     feature_layer=args.teacher_feature_layer,
+                    early_exit_after_feature=True,
                 )
                 feat_teacher = output.extra.get("features")
                 feat_teacher = feat_teacher.detach() if feat_teacher is not None else None
