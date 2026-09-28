@@ -7,6 +7,7 @@ trainers with a `--loss_fn` that needs the model's clean-latent estimate
 `energy_beta` (local high-frequency energy matching against flat-region mottle) or `mottle_metrics`.
 
 - Source: [github.com/rockerBOO/wavelet-loss](https://github.com/rockerBOO/wavelet-loss) (`wavelet_loss.musubi` adapters)
+- Why x0-Huber / energy matching: wavelet-loss [`docs/mottle-x0-huber.md`](https://github.com/rockerBOO/wavelet-loss/blob/main/docs/mottle-x0-huber.md)
 
 ## Trainers
 
