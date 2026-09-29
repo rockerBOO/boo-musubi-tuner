@@ -9,6 +9,7 @@ Repo: [github.com/rockerBOO/boo-musubi-tuner](https://github.com/rockerBOO/boo-m
 - [Self-Flow](docs/self-flow.md) — self-distillation flow-matching training for FLUX.2 and Krea 2
 - [Explorative Modeling](docs/explorative-modeling.md) — best-of-K candidate training for FLUX.2 and Krea 2
 - [Wavelet Loss](docs/wavelet-loss.md) — frequency-domain auxiliary loss for FLUX.2
+- [Loss Context](docs/loss-context.md) — FLUX.2 / Krea 2 trainers that expose `noisy_model_input` to `--loss_fn`
 
 ## Setup
 
