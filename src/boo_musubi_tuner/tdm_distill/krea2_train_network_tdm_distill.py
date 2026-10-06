@@ -26,8 +26,10 @@ from safetensors.torch import load_file
 from boo_musubi_tuner.tdm_distill.tdm_distill import (
     LoraRoleSwitcher,
     cfg_combine,
+    critic_importance_weight,
     diversity_loss_from_embeddings,
     fake_score_denoising_loss,
+    forward_transition,
     min_snr_weight,
     pseudo_huber_c,
     pseudo_huber_loss,
@@ -248,7 +250,7 @@ class Krea2TdmDistillNetworkTrainer(Krea2NetworkTrainer):
         self._role_switcher.init_from(unwrapped_nw.state_dict())
 
         if args.fake_score_learning_rate is None:
-            args.fake_score_learning_rate = args.learning_rate * 10.0
+            args.fake_score_learning_rate = args.learning_rate * 5.0
         if args.fake_score_optimizer_type is None:
             args.fake_score_optimizer_type = args.optimizer_type
 
@@ -685,21 +687,38 @@ class Krea2TdmDistillNetworkTrainer(Krea2NetworkTrainer):
             x_i, x_ti = trajectory[interval], trajectory[interval + 1]
             t_i, t_i_plus_1 = ts[interval], ts[interval + 1]
 
-            # 2. diffuse x_ti with fresh noise to get x_tau, roughly halfway into the interval.
+            # 2. diffuse x_ti to get x_tau, roughly halfway into the interval.
             tau = (t_i + t_i_plus_1) / 2.0
             fresh_noise = torch.randn_like(x_ti.detach())
-            x_tau = (1 - tau) * x_ti.detach() + tau * fresh_noise
+            nd = x_ti.dim() - 1
+            if args.tdm_critic_input == "paper":
+                # Paper / official-code critic: x_tau comes from the forward transition of the ODE
+                # point x_ti (noise level t_i_plus_1), and the critic regresses the student's clean
+                # estimate x0_hat, with the importance weight on the loss.
+                v_student = (x_i.detach() - x_ti.detach()) / (t_i - t_i_plus_1)
+                x0_hat = x_i.detach() - t_i * v_student
+                x_tau, _ = forward_transition(x_ti.detach(), t_i_plus_1, tau, fresh_noise)
+                mixed_noise = (x_tau - (1 - tau) * x0_hat) / tau
+                critic_target = (mixed_noise - x0_hat).detach()
+                is_weight = critic_importance_weight(mixed_noise, fresh_noise).view(-1, *([1] * nd)).detach()
+            else:
+                # Legacy: treat x_ti as clean data and re-noise it.
+                x_tau = (1 - tau) * x_ti.detach() + tau * fresh_noise
+                critic_target = (fresh_noise - x_ti.detach()).detach()
+                is_weight = 1.0
             timesteps_tau = torch.full((x_ti.shape[0],), tau * 1000.0, device=device, dtype=torch.float32)
 
-            # 3. fake-score update: predict at x_tau, denoise toward x_ti, step its own optimizer.
+            # 3. fake-score update: predict at x_tau, denoise toward the target, step its own optimizer.
             switcher.use_fake_score()
             fake_score_pred = self.call_dit(
                 args, accelerator, transformer, x_tau, batch, fresh_noise, x_tau, timesteps_tau, network_dtype
             ).pred
-            fake_score_target = (fresh_noise - x_ti.detach()).detach()
-            omega_tau = min_snr_weight(tau)
+            fake_score_target = critic_target
+            omega_tau = min_snr_weight(tau) * is_weight
             fake_score_loss = fake_score_denoising_loss(fake_score_pred, fake_score_target, omega_tau=omega_tau)
             accelerator.backward(fake_score_loss)
+            if args.max_grad_norm and args.max_grad_norm > 0:
+                torch.nn.utils.clip_grad_norm_([p for p in network.parameters() if p.grad is not None], args.max_grad_norm)
             self._fake_score_optimizer.step()
             self._fake_score_optimizer.zero_grad(set_to_none=True)
 
@@ -858,10 +877,18 @@ def tdm_distill_setup_parser(parser: argparse.ArgumentParser) -> argparse.Argume
         "every --tdm_distill run must set this explicitly.",
     )
     parser.add_argument(
+        "--tdm_critic_input",
+        choices=["paper", "legacy"],
+        default="paper",
+        help="How the fake-score critic's training input/target are built. 'paper' follows the TDM paper and "
+        "official code (forward-transition x_tau, clean-estimate target, importance weight). 'legacy' treats "
+        "x_ti as clean data and re-noises it (the original implementation here).",
+    )
+    parser.add_argument(
         "--fake_score_learning_rate",
         type=float,
         default=None,
-        help="LR for the fake-score critic's own optimizer. Defaults to 10x --learning_rate (paper ratio).",
+        help="LR for the fake-score critic's own optimizer. Defaults to 5x --learning_rate (official-code ratio).",
     )
     parser.add_argument(
         "--fake_score_optimizer_type",

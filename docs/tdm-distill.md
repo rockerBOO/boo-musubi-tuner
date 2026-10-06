@@ -59,7 +59,8 @@ if needed.
 | `--tdm_diversity_weight` | 0.1 | Constant weight on the diversity loss (not annealed — see below) |
 | `--tdm_diversity_memory_efficient` | off | Two-pass per-sample diversity gradient accumulation; same math, lower peak VRAM, slower |
 | `--tdm_guidance_scale` | required, no default | CFG scale for the teacher's real-score forward (`uncond + scale*(cond-uncond)`); `<= 1.0` disables CFG |
-| `--fake_score_learning_rate` | 10x `--learning_rate` | Fake-score critic's own optimizer LR |
+| `--fake_score_learning_rate` | 5x `--learning_rate` | Fake-score critic's own optimizer LR |
+| `--tdm_critic_input` | `paper` | `paper`: critic input/target follow the paper and official code (forward-transition `x_tau`, clean-estimate target, importance weight). `legacy`: the original behaviour (re-noise `x_ti` as clean data) |
 | `--fake_score_optimizer_type` | mirrors `--optimizer_type` | Fake-score critic's optimizer |
 
 ## The diversity term is a real training signal, not a metric

@@ -21,8 +21,10 @@ __all__ = [
     "Dinov3ImageEmbedder",
     "LoraRoleSwitcher",
     "cfg_combine",
+    "critic_importance_weight",
     "diversity_loss_from_embeddings",
     "fake_score_denoising_loss",
+    "forward_transition",
     "min_snr_weight",
     "pairwise_cosine_diversity",
     "pseudo_huber_c",
@@ -73,6 +75,29 @@ def fake_score_denoising_loss(
     target. omega_tau is a plain scalar/per-example weight, not the paper's full importance-
     sampling ratio (documented simplification, see docs/tdm-distill.md)."""
     return (omega_tau * (fake_score_pred - target) ** 2).mean()
+
+
+def forward_transition(x_t: torch.Tensor, t: float, tau: float, noise: torch.Tensor) -> "tuple[torch.Tensor, torch.Tensor]":
+    """Diffuse an ODE-trajectory sample x_t (already at noise level t) up to the noisier level tau >= t.
+
+    Uses the forward transition kernel of x_s = (1-s)*x0 + s*eps: x_tau = a*x_t + s_std*noise with
+    a = (1-tau)/(1-t) and s_std**2 = tau**2 - (a*t)**2. Unlike (1-tau)*x_t + tau*noise, which treats
+    x_t as clean data, this keeps x_tau on the teacher's marginal at level tau.
+
+    Returns (x_tau, a). Needs t < 1 and tau >= t.
+    """
+    a = (1.0 - tau) / (1.0 - t)
+    var = max(tau**2 - (a * t) ** 2, 0.0)
+    return a * x_t + math.sqrt(var) * noise, a
+
+
+def critic_importance_weight(mixed_noise: torch.Tensor, rand_noise: torch.Tensor) -> torch.Tensor:
+    """Per-example importance weight for the fake-score loss (TDM Eq. 7, official-code form):
+    exp(-0.5*mean(mixed**2)) / exp(-0.5*mean(rand**2)), where mixed_noise is the noise x_tau
+    carries relative to the clean estimate and rand_noise is the fresh noise actually drawn."""
+    m = mixed_noise.flatten(1).pow(2).mean(dim=1)
+    r = rand_noise.flatten(1).pow(2).mean(dim=1)
+    return torch.exp(-0.5 * (m - r))
 
 
 def min_snr_weight(tau: float, gamma: float = 5.0) -> float:

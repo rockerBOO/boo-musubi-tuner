@@ -37,14 +37,14 @@ def test_on_train_start_noop_without_tdm_distill():
     assert trainer._fake_score_optimizer is None
 
 
-def test_fake_score_lr_defaults_to_10x_learning_rate():
+def test_fake_score_lr_defaults_to_5x_learning_rate():
     trainer = Krea2TdmDistillNetworkTrainer()
     args = make_args(learning_rate=2e-6, fake_score_learning_rate=None, optimizer_type="AdamW")
     net = StubLoraNetwork()
     acc = FakeAccelerator()
     trainer.handle_model_specific_args(args)
     trainer.on_train_start(args, acc, net, None, None)
-    assert args.fake_score_learning_rate == pytest.approx(2e-5)
+    assert args.fake_score_learning_rate == pytest.approx(1e-5)
 
 
 def test_fake_score_lr_explicit_value_kept():
