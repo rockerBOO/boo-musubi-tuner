@@ -149,6 +149,27 @@ class Krea2TdmDistillNetworkTrainer(Krea2NetworkTrainer):
         weights_sd = load_file(args.tdm_turbo_lora_init)
         network = network_module.create_arch_network_from_weights(1.0, weights_sd, unet=transformer)
 
+        # create_arch_network_from_weights (the "from weights" construction path) never forwards
+        # dropout kwargs into LoRANetwork -- true of musubi-tuner's own --dim_from_weights path too
+        # (trainer_base.py calls the same function with no net_kwargs), not something specific to
+        # this trainer. --network_args's rank_dropout/module_dropout (the standard mechanism
+        # elsewhere) are consequently inert here. LoRAModule reads dropout/rank_dropout/
+        # module_dropout as plain instance attributes at forward time (see lora.py's
+        # LoRAModule.forward), so setting them directly on each already-constructed module after
+        # the fact applies them without needing a different construction path.
+        net_kwargs = {}
+        if args.network_args is not None:
+            for net_arg in args.network_args:
+                key, value = net_arg.split("=")
+                net_kwargs[key] = value
+        rank_dropout = net_kwargs.get("rank_dropout")
+        module_dropout = net_kwargs.get("module_dropout")
+        if args.network_dropout is not None or rank_dropout is not None or module_dropout is not None:
+            for lora_module in network.unet_loras:
+                lora_module.dropout = args.network_dropout
+                lora_module.rank_dropout = float(rank_dropout) if rank_dropout is not None else None
+                lora_module.module_dropout = float(module_dropout) if module_dropout is not None else None
+
         if hasattr(network_module, "prepare_network"):
             network.prepare_network(args)
 
@@ -295,6 +316,8 @@ class Krea2TdmDistillNetworkTrainer(Krea2NetworkTrainer):
         super().on_before_sample_images(accelerator, args, epoch, steps, vae, transformer, network, sample_parameters, dit_dtype)
         if not args.tdm_distill:
             return
+        if accelerator.device.type == "cuda":  # TODO temporary VRAM debugging, remove
+            torch.cuda.reset_peak_memory_stats(accelerator.device)
         # Mirrors trainer_base.py's own optimizer_eval_fn() call immediately before it invokes
         # _do_sample() (which calls this hook, then sample_images(), then on_after_sample_images):
         # a schedule-free fake-score optimizer must be in eval mode for inference, same as the
@@ -307,6 +330,10 @@ class Krea2TdmDistillNetworkTrainer(Krea2NetworkTrainer):
         super().on_after_sample_images(accelerator, args, epoch, steps, vae, transformer, network, sample_parameters, dit_dtype)
         if not args.tdm_distill:
             return
+        if accelerator.device.type == "cuda":  # TODO temporary VRAM debugging, remove
+            peak_allocated = torch.cuda.max_memory_allocated(accelerator.device)
+            peak_reserved = torch.cuda.max_memory_reserved(accelerator.device)
+            logger.info(f"sample_images peak: allocated={peak_allocated / 1e9:.2f}GB reserved={peak_reserved / 1e9:.2f}GB")
         # Mirrors trainer_base.py's own optimizer_train_fn() call right after _do_sample()
         # returns, restoring train mode for the next optimizer.step() call.
         self._fake_score_optimizer_train_fn()
@@ -375,9 +402,7 @@ class Krea2TdmDistillNetworkTrainer(Krea2NetworkTrainer):
                 t0 = time.perf_counter()
                 accelerator.unwrap_model(transformer).prepare_block_swap_before_forward()
                 self._block_reset_count = getattr(self, "_block_reset_count", 0) + 1
-                logger.info(
-                    "call_dit block-swap reset #%d took %.1fms", self._block_reset_count, (time.perf_counter() - t0) * 1000
-                )
+                logger.info("call_dit block-swap reset #%d took %.1fms", self._block_reset_count, (time.perf_counter() - t0) * 1000)
             else:
                 accelerator.unwrap_model(transformer).prepare_block_swap_before_forward()
         return super().call_dit(
@@ -435,11 +460,16 @@ class Krea2TdmDistillNetworkTrainer(Krea2NetworkTrainer):
         return trajectory, list(ts)
 
     def _diversity_loss_full(
-        self, args, accelerator, transformer, single_prompt_batch, vae, device, dit_dtype, network_dtype
-    ) -> "tuple[torch.Tensor, bool]":
+        self, args, accelerator, transformer, network, single_prompt_batch, vae, device, dit_dtype, network_dtype
+    ) -> "tuple[torch.Tensor, bool, dict[str, float]]":
         """Batched diversity rollout over the whole group at once (today's only behavior before the
-        memory-efficient alternative existed). Returns (div_loss, False) -- False means the caller
-        still needs to fold div_loss * tdm_diversity_weight into the returned training loss itself."""
+        memory-efficient alternative existed). Returns (div_loss, False, {}) -- False means the caller
+        still needs to fold div_loss * tdm_diversity_weight into the returned training loss itself.
+        `network` is unused here (only needed by _diversity_loss_memory_efficient for its grad-norm
+        snapshot) but kept in the signature so process_batch can call either path uniformly.
+        The empty metrics dict is because div_loss here hasn't been backpropped yet -- isolating its
+        gradient would need an extra backward pass through the whole rollout graph, which this path
+        doesn't do (see _diversity_loss_memory_efficient for the path that gets it for free)."""
         group_trajectory, _ = self._student_rollout(
             args,
             accelerator,
@@ -473,11 +503,11 @@ class Krea2TdmDistillNetworkTrainer(Krea2NetworkTrainer):
         pixel_batch = torch.clamp(pixels.float(), 0.0, 1.0)
         embeddings = self._dinov3_embedder.embed_differentiable(pixel_batch)
         div_loss = diversity_loss_from_embeddings(embeddings)
-        return div_loss, False
+        return div_loss, False, {}
 
     def _diversity_loss_memory_efficient(
-        self, args, accelerator, transformer, single_prompt_batch, vae, device, dit_dtype, network_dtype
-    ) -> "tuple[torch.Tensor, bool]":
+        self, args, accelerator, transformer, network, single_prompt_batch, vae, device, dit_dtype, network_dtype
+    ) -> "tuple[torch.Tensor, bool, dict[str, float]]":
         """Same diversity loss as _diversity_loss_full, computed via two passes so peak VRAM is
         bounded to one sample's rollout graph instead of group_size of them. Pass 1 (no_grad, whole
         group batched) gets the embeddings needed to compute the real pairwise loss and its gradient
@@ -559,7 +589,16 @@ class Krea2TdmDistillNetworkTrainer(Krea2NetworkTrainer):
             sample_embedding = self._dinov3_embedder.embed_differentiable(sample_pixel_batch)
             accelerator.backward(sample_embedding, gradient=upstream_grad[i : i + 1])
 
-        return unweighted_div_loss.detach(), True
+        # Grads on `network`'s params at this point come solely from the diversity backward
+        # above -- the base trainer zeroes grads at the end of the previous step and the student
+        # loss below hasn't been backpropped yet -- so this is diversity's isolated contribution,
+        # not a combined norm.
+        diversity_grad_metrics = {}
+        if args.log_grad_metrics:
+            diversity_grad_metrics = {
+                f"grad/diversity_{k.split('/', 1)[1]}": v for k, v in self.collect_grad_metrics(network.parameters()).items()
+            }
+        return unweighted_div_loss.detach(), True, diversity_grad_metrics
 
     def process_batch(
         self,
@@ -707,6 +746,7 @@ class Krea2TdmDistillNetworkTrainer(Krea2NetworkTrainer):
 
         div_loss = None
         div_already_backpropped = False
+        div_grad_metrics = {}
         if args.tdm_diversity_weight > 0.0 and vae is not None:
             if self._dinov3_embedder is None:
                 from boo_musubi_tuner.tdm_distill.tdm_distill import Dinov3ImageEmbedder
@@ -724,8 +764,8 @@ class Krea2TdmDistillNetworkTrainer(Krea2NetworkTrainer):
             diversity_fn = (
                 self._diversity_loss_memory_efficient if args.tdm_diversity_memory_efficient else self._diversity_loss_full
             )
-            div_loss, div_already_backpropped = diversity_fn(
-                args, accelerator, transformer, single_prompt_batch, vae, device, dit_dtype, network_dtype
+            div_loss, div_already_backpropped, div_grad_metrics = diversity_fn(
+                args, accelerator, transformer, network, single_prompt_batch, vae, device, dit_dtype, network_dtype
             )
 
         # 6. student loss: re-run the single Euler step landing on x_ti, now with grad. This must
@@ -755,6 +795,7 @@ class Krea2TdmDistillNetworkTrainer(Krea2NetworkTrainer):
             # div_loss is a graph-carrying tensor; metrics are plain floats by convention.
             loss_metrics["loss/diversity"] = div_loss.detach().item()
             loss_metrics["tdm/diversity_score"] = -div_loss.detach().item()
+            loss_metrics.update(div_grad_metrics)
 
         return loss, loss_metrics
 

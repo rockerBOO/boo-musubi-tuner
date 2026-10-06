@@ -1,8 +1,8 @@
 """Build a --dataset_config-ready dataset directory from the 300-prompt eval set.
 
 Reuses smoke_test_data's 4 fixture images (content is discarded by the TDM distill trainer,
-only latent shape matters) and, where possible, its already-computed 256x256 latent caches, to
-avoid re-encoding duplicate image content 300 times. Text-encoder caching still runs for real
+only latent shape matters) and, where possible, its already-computed latent caches at RESOLUTION,
+to avoid re-encoding duplicate image content 300 times. Text-encoder caching still runs for real
 since every caption is unique.
 """
 
@@ -12,7 +12,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-RESOLUTION = 256
+RESOLUTION = 512
 PROMPTS_PATH = Path("notes/tdm-distill-eval-prompts.txt")
 SMOKE_TEST_IMAGES = Path("smoke_test_data/images")
 SMOKE_TEST_CACHE = Path("smoke_test_data/cache")

@@ -23,8 +23,12 @@ musubi-tuner branch or core patch to run — check that extension's doc under `d
 before running it.
 
 ```bash
-uv sync
+uv sync --extra cu124   # or cu128 / cu130 / cu132 / cpu, matching the CUDA driver
 ```
+
+Plain `uv sync` with no `--extra` resolves a CPU-only `torch` silently (no error) — training then runs on
+CPU with no warning, just very slowly. Always pass a `--extra` matching the target machine's CUDA driver
+(or `cpu` for CPU-only machines).
 
 ## Commands
 

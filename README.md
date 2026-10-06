@@ -17,8 +17,13 @@ Repo: [github.com/rockerBOO/boo-musubi-tuner](https://github.com/rockerBOO/boo-m
 ```bash
 git clone https://github.com/rockerBOO/boo-musubi-tuner.git
 cd boo-musubi-tuner
-uv sync
+uv sync --extra cu124   # or cu128 / cu130 / cu132 / cpu, matching your CUDA driver
 ```
+
+Plain `uv sync` (no `--extra`) does not error, but resolves `torch`/`torchvision` from PyPI's default
+index without any of the CUDA-specific wheels — you get a CPU-only build silently. Training will then run
+on CPU with no error or warning, just extremely slowly. Pick the `cuXXX` extra matching your installed
+CUDA driver version, or `cpu` if you don't have a GPU.
 
 `musubi-tuner` is pulled in as a dependency, pinned to a branch on the
 [rockerBOO fork](https://github.com/rockerBOO/musubi-tuner) (needed for Explorative Modeling's
