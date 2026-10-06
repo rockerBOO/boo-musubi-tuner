@@ -805,7 +805,8 @@ class Krea2TdmDistillNetworkTrainer(Krea2NetworkTrainer):
             "tdm/k": float(num_steps),
             "tdm/interval": float(interval),
             "tdm/tau": float(tau),
-            "tdm/omega_tau": float(omega_tau),
+            "tdm/omega_tau": float(min_snr_weight(tau)),
+            "tdm/is_weight": float(torch.as_tensor(is_weight).float().mean()),
         }
 
         if div_loss is not None:

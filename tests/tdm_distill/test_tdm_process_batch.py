@@ -357,3 +357,19 @@ def test_process_batch_fake_score_loss_uses_min_snr_weight(tiny_k2_model, monkey
     assert len(calls) == 1
     assert calls[0] != 1.0
     assert 0.0 <= calls[0] <= 5.0
+
+
+def test_process_batch_batch_larger_than_one_paper_critic(tiny_k2_model):
+    """Regression: the critic's importance weight is per-example, so metrics must reduce it."""
+    torch.manual_seed(7)
+    trainer, args, acc, net, _handle = _prepared_trainer(tiny_k2_model, tdm_critic_input="paper")
+    for p in tiny_k2_model.parameters():
+        p.requires_grad_(True)
+    batch, latents, noise = make_k2_batch(B=3, H=8, W=8, n_txt=3)
+    scheduler = make_noise_scheduler(args)
+
+    loss, metrics = trainer.process_batch(
+        args, acc, tiny_k2_model, net, batch, latents, noise, scheduler, torch.float32, torch.float32, None, global_step=0
+    )
+    assert torch.isfinite(loss)
+    assert 0.0 < metrics["tdm/is_weight"] < 10.0
