@@ -76,6 +76,30 @@ plain tensor ops, and has no `@torch.no_grad()` decorator so gradient can reach 
 When `--tdm_diversity_weight > 0`, this term actively shapes what
 the student learns — it is not a passive/logging-only metric computed on the side.
 
+## Mottle term and evaluation
+
+The turbo LoRA leaves blotchy noise in flat regions. Plain TDM does not change it, because nothing in the
+loss sees it. `--tdm_mottle_weight` adds a loss that compares the student's flat-region high-pass energy with
+the frozen teacher's. It penalizes only the excess above `1 + --tdm_mottle_margin`, so it stops pulling once
+the student is within the margin. A smaller margin pulls further.
+
+Settings that worked for a 500-step run: start from the turbo LoRA with blocks 25-27 `lora_up` scaled by
+0.25, weight 20, batch 4, learning rate 5e-6 with `cosine_with_min_lr` (`--lr_scheduler_min_lr_ratio 0.2`,
+so it ends at 1e-6), 50 warmup steps. A learning rate of 2e-5 broke some seeds. The critic has no scheduler
+and keeps its own constant learning rate.
+
+Judge a run by sampling several seeds of a smooth prompt (a plain colour gradient) and a scene prompt, not
+by one seed. The same seed gives nearly the same image across steps, so the mottle looks unchanged by eye.
+Three helper scripts, none of them project dependencies:
+
+- `scripts/kohya_to_comfy_lora.py` converts a saved checkpoint to ComfyUI key names, using the original
+  ComfyUI turbo LoRA as the template. Use the result in place of the turbo LoRA.
+- `scripts/eval_mottle.py` compares image sets per colour channel with clipped pixels excluded. `blob`
+  (wavelet level 3) and the latent high-pass (`latHP`, and `flatHP` for scenes) rank known clean and mottled
+  sets correctly. The row-bias and 8 px periodic metrics do not, so read them as diagnostics only.
+- `scripts/mottle_contact_sheet.py` makes labelled sheets: full images plus a high-pass view for gradients,
+  sky and detail crops for scenes.
+
 ## Known limitations
 
 - **Data-free**: ignores the dataset's cached image latents entirely — only prompts are used. Every
