@@ -85,7 +85,7 @@ the student is within the margin. A smaller margin pulls further.
 
 Settings that worked for a 500-step run: start from the turbo LoRA with blocks 25-27 `lora_up` scaled by
 0.25, weight 20, batch 4, learning rate 5e-6 with `cosine_with_min_lr` (`--lr_scheduler_min_lr_ratio 0.2`,
-so it ends at 1e-6), 50 warmup steps. A learning rate of 2e-5 broke some seeds. The critic has no scheduler
+so it ends at 1e-6), 50 warmup steps. A learning rate of 2e-5 broke some seeds. A tighter flat mask (`--tdm_mottle_flat_quantile 0.15`) gave no gain over the default 0.5 in a 200-step run. The critic has no scheduler
 and keeps its own constant learning rate.
 
 Judge a run by sampling several seeds of a smooth prompt (a plain colour gradient) and a scene prompt, not
