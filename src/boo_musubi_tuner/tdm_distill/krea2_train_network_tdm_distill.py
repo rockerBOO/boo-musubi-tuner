@@ -31,6 +31,7 @@ from boo_musubi_tuner.tdm_distill.tdm_distill import (
     fake_score_denoising_loss,
     forward_transition,
     min_snr_weight,
+    mottle_excess_loss,
     pseudo_huber_c,
     pseudo_huber_loss,
     revised_sample,
@@ -738,6 +739,15 @@ class Krea2TdmDistillNetworkTrainer(Krea2NetworkTrainer):
                     real_score = cfg_combine(cond_score, uncond_score, args.tdm_guidance_scale)
                 else:
                     real_score = cond_score
+            mottle_ref_x0 = None
+            if args.tdm_mottle_weight > 0.0 and t_i <= args.tdm_mottle_max_t:
+                # Opt-in anti-mottle term: the teacher's clean estimate at the student's own input.
+                with torch.no_grad():
+                    ts_i = torch.full((x_i.shape[0],), t_i * 1000.0, device=device, dtype=torch.float32)
+                    teacher_v = self.call_dit(
+                        args, accelerator, transformer, x_i.detach(), batch, trajectory[0], x_i.detach(), ts_i, network_dtype
+                    ).pred
+                    mottle_ref_x0 = (x_i.detach() - t_i * teacher_v).detach()
             switcher.use_fake_score()
             with torch.no_grad():
                 fake_score_updated = self.call_dit(
@@ -799,6 +809,13 @@ class Krea2TdmDistillNetworkTrainer(Krea2NetworkTrainer):
         data_dim = x_ti.shape[1:].numel()
         loss = pseudo_huber_loss(x_ti_student, x_revised, c=pseudo_huber_c(data_dim))
 
+        mottle_loss = None
+        if mottle_ref_x0 is not None:
+            x0_student = x_i - t_i * student_pred
+            mottle_loss, mottle_ratio = mottle_excess_loss(
+                x0_student, mottle_ref_x0, margin=args.tdm_mottle_margin, flat_quantile=args.tdm_mottle_flat_quantile
+            )
+
         loss_metrics = {
             "loss/tdm": loss.detach().item(),
             "loss/fake_score": fake_score_loss.detach().item(),
@@ -808,6 +825,11 @@ class Krea2TdmDistillNetworkTrainer(Krea2NetworkTrainer):
             "tdm/omega_tau": float(min_snr_weight(tau)),
             "tdm/is_weight": float(torch.as_tensor(is_weight).float().mean()),
         }
+
+        if mottle_loss is not None:
+            loss = loss + args.tdm_mottle_weight * mottle_loss
+            loss_metrics["loss/mottle"] = mottle_loss.detach().item()
+            loss_metrics["tdm/mottle_energy_ratio"] = float(mottle_ratio)
 
         if div_loss is not None:
             if not div_already_backpropped:
@@ -876,6 +898,23 @@ def tdm_distill_setup_parser(parser: argparse.ArgumentParser) -> argparse.Argume
         help="CFG scale for the teacher's real-score forward: uncond + scale * (cond - uncond). "
         "<= 1.0 disables CFG (single conditional teacher forward, no extra cost). No default -- "
         "every --tdm_distill run must set this explicitly.",
+    )
+    parser.add_argument(
+        "--tdm_mottle_weight",
+        type=float,
+        default=0.0,
+        help="Opt-in anti-mottle term weight (0 = off, plain TDM). Adds one frozen-teacher forward per step and "
+        "penalizes the student's clean estimate for flat-region high-pass energy above the teacher's.",
+    )
+    parser.add_argument("--tdm_mottle_margin", type=float, default=0.1, help="Allowed excess over teacher energy (ratio).")
+    parser.add_argument(
+        "--tdm_mottle_flat_quantile", type=float, default=0.5, help="Fraction of lowest-gradient positions treated as flat."
+    )
+    parser.add_argument(
+        "--tdm_mottle_max_t",
+        type=float,
+        default=0.6,
+        help="Apply the term only to intervals starting at or below this noise level (clean estimates are meaningful late).",
     )
     parser.add_argument(
         "--tdm_critic_input",

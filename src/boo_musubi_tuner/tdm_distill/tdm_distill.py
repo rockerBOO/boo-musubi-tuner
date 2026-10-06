@@ -10,6 +10,7 @@ docs/tdm-distill.md for known simplifications vs. the paper.
 import math
 
 import torch
+import torch.nn.functional as F
 
 from boo_musubi_tuner.diversity.diversity import (
     Dinov3ImageEmbedder,
@@ -25,7 +26,9 @@ __all__ = [
     "diversity_loss_from_embeddings",
     "fake_score_denoising_loss",
     "forward_transition",
+    "gaussian_blur_latent",
     "min_snr_weight",
+    "mottle_excess_loss",
     "pairwise_cosine_diversity",
     "pseudo_huber_c",
     "pseudo_huber_loss",
@@ -98,6 +101,60 @@ def critic_importance_weight(mixed_noise: torch.Tensor, rand_noise: torch.Tensor
     m = mixed_noise.flatten(1).pow(2).mean(dim=1)
     r = rand_noise.flatten(1).pow(2).mean(dim=1)
     return torch.exp(-0.5 * (m - r))
+
+
+def gaussian_blur_latent(x: torch.Tensor, sigma: float) -> torch.Tensor:
+    """Separable Gaussian blur over the last two dims of a (B, C, [1,] H, W) latent. Differentiable."""
+    shape = x.shape
+    h, w = shape[-2:]
+    x4 = x.reshape(-1, 1, h, w)
+    radius = max(math.ceil(3 * sigma), 1)
+    coords = torch.arange(-radius, radius + 1, device=x.device, dtype=x.dtype)
+    k = torch.exp(-0.5 * (coords / sigma) ** 2)
+    k = k / k.sum()
+    x4 = F.pad(x4, (radius, radius, 0, 0), mode="reflect")
+    x4 = F.conv2d(x4, k.view(1, 1, 1, -1))
+    x4 = F.pad(x4, (0, 0, radius, radius), mode="reflect")
+    x4 = F.conv2d(x4, k.view(1, 1, -1, 1))
+    return x4.reshape(shape)
+
+
+def mottle_excess_loss(
+    x0_student: torch.Tensor,
+    x0_ref: torch.Tensor,
+    margin: float = 0.1,
+    flat_quantile: float = 0.5,
+    sigma: float = 1.5,
+) -> "tuple[torch.Tensor, torch.Tensor]":
+    """Opt-in anti-mottle term. Penalizes the student's clean estimate for carrying more
+    latent-pixel high-pass energy than the reference (teacher) estimate in flat regions.
+
+    High-pass = x - gaussian(x, sigma) per channel. Flat region = the lowest `flat_quantile`
+    of the reference's local gradient magnitude (per example). Energy is matched, not minimized:
+    only the excess over reference*(1+margin) is penalized, as a ratio, so detail the teacher
+    also has is left alone. Gradient flows through the student only.
+
+    Returns (loss, mean energy ratio student/reference) for logging.
+    """
+    ref = x0_ref.detach()
+    hp_s = x0_student - gaussian_blur_latent(x0_student, sigma)
+    hp_r = ref - gaussian_blur_latent(ref, sigma)
+
+    low = gaussian_blur_latent(ref, 2.0)
+    gy = low[..., 1:, :-1] - low[..., :-1, :-1]
+    gx = low[..., :-1, 1:] - low[..., :-1, :-1]
+    grad = (gx.pow(2) + gy.pow(2)).mean(dim=1)  # (B, [1,] h-1, w-1), mean over channels
+    grad = F.pad(grad, (0, 1, 0, 1), mode="replicate")
+    b = grad.shape[0]
+    thr = torch.quantile(grad.reshape(b, -1).float(), flat_quantile, dim=1).view(b, *([1] * (grad.dim() - 1)))
+    mask = (grad <= thr).to(x0_student.dtype).unsqueeze(1)  # (B, 1, [1,] H, W)
+
+    denom = mask.flatten(1).sum(dim=1).clamp(min=1.0).view(b, 1)  # per example
+    e_s = (hp_s.pow(2) * mask).flatten(2).sum(dim=2) / denom  # (B, C)
+    e_r = (hp_r.pow(2) * mask).flatten(2).sum(dim=2) / denom
+    ratio = e_s / (e_r + 1e-8)
+    excess = F.relu(e_s - e_r * (1.0 + margin)) / (e_r + 1e-8)
+    return excess.mean(), ratio.detach().mean()
 
 
 def min_snr_weight(tau: float, gamma: float = 5.0) -> float:

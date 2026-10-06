@@ -61,6 +61,8 @@ if needed.
 | `--tdm_guidance_scale` | required, no default | CFG scale for the teacher's real-score forward (`uncond + scale*(cond-uncond)`); `<= 1.0` disables CFG |
 | `--fake_score_learning_rate` | 5x `--learning_rate` | Fake-score critic's own optimizer LR |
 | `--tdm_critic_input` | `paper` | `paper`: critic input/target follow the paper and official code (forward-transition `x_tau`, clean-estimate target, importance weight). `legacy`: the original behaviour (re-noise `x_ti` as clean data) |
+| `--tdm_mottle_weight` | `0` (off) | Opt-in anti-mottle term. Penalizes the student's clean estimate for flat-region latent high-pass energy above the teacher's (ratio excess over `1 + margin`). Adds one frozen-teacher forward per step. Not part of the TDM paper |
+| `--tdm_mottle_margin` / `--tdm_mottle_flat_quantile` / `--tdm_mottle_max_t` | `0.1` / `0.5` / `0.6` | Allowed excess ratio; fraction of lowest-gradient positions treated as flat; only apply to intervals starting at or below this noise level |
 | `--fake_score_optimizer_type` | mirrors `--optimizer_type` | Fake-score critic's optimizer |
 
 ## The diversity term is a real training signal, not a metric

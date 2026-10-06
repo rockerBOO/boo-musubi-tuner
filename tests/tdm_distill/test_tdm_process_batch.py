@@ -373,3 +373,35 @@ def test_process_batch_batch_larger_than_one_paper_critic(tiny_k2_model):
     )
     assert torch.isfinite(loss)
     assert 0.0 < metrics["tdm/is_weight"] < 10.0
+
+
+def test_process_batch_mottle_term_opt_in(tiny_k2_model):
+    torch.manual_seed(8)
+    trainer, args, acc, net, _handle = _prepared_trainer(
+        tiny_k2_model, tdm_mottle_weight=1.0, tdm_mottle_max_t=1.0, tdm_step_counts="4"
+    )
+    for p in tiny_k2_model.parameters():
+        p.requires_grad_(True)
+    batch, latents, noise = make_k2_batch(B=2, H=16, W=16, n_txt=3)
+    scheduler = make_noise_scheduler(args)
+    loss, metrics = trainer.process_batch(
+        args, acc, tiny_k2_model, net, batch, latents, noise, scheduler, torch.float32, torch.float32, None, global_step=0
+    )
+    assert torch.isfinite(loss)
+    if "loss/mottle" in metrics:  # only intervals with t_i <= max_t carry it; max_t=1.0 allows all
+        assert "tdm/mottle_energy_ratio" in metrics
+    loss.backward()
+    assert net.lora_w.grad is not None
+
+
+def test_process_batch_mottle_off_by_default(tiny_k2_model):
+    torch.manual_seed(9)
+    trainer, args, acc, net, _handle = _prepared_trainer(tiny_k2_model)
+    for p in tiny_k2_model.parameters():
+        p.requires_grad_(True)
+    batch, latents, noise = make_k2_batch(B=1, H=8, W=8, n_txt=3)
+    scheduler = make_noise_scheduler(args)
+    _, metrics = trainer.process_batch(
+        args, acc, tiny_k2_model, net, batch, latents, noise, scheduler, torch.float32, torch.float32, None, global_step=0
+    )
+    assert "loss/mottle" not in metrics
